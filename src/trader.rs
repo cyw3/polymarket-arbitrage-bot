@@ -296,19 +296,31 @@ impl Trader {
               units, opportunity.btc_down_price);
 
         // In simulation mode, we track the trade and will calculate actual profit when markets close
+        // Use condition IDs as key - accumulate multiple trades in the same period
         let trade_key = format!("{}_{}", opportunity.eth_condition_id, opportunity.btc_condition_id);
-        let pending_trade = PendingTrade {
-            eth_token_id: opportunity.eth_up_token_id.clone(),
-            btc_token_id: opportunity.btc_down_token_id.clone(),
-            eth_condition_id: opportunity.eth_condition_id.clone(),
-            btc_condition_id: opportunity.btc_condition_id.clone(),
-            investment_amount: position_size,
-            units,
-            timestamp: std::time::Instant::now(),
-        };
         
         let mut pending = self.pending_trades.lock().await;
-        pending.insert(trade_key, pending_trade);
+        
+        // If we already have a trade for this period, accumulate it (add units and investment)
+        if let Some(existing_trade) = pending.get_mut(&trade_key) {
+            // Accumulate: add new units and investment to existing trade
+            existing_trade.units += units;
+            existing_trade.investment_amount += position_size;
+            info!("   📊 Accumulated trade: Total units: {:.2}, Total investment: ${:.2}", 
+                  existing_trade.units, existing_trade.investment_amount);
+        } else {
+            // First trade for this period - create new entry
+            let pending_trade = PendingTrade {
+                eth_token_id: opportunity.eth_up_token_id.clone(),
+                btc_token_id: opportunity.btc_down_token_id.clone(),
+                eth_condition_id: opportunity.eth_condition_id.clone(),
+                btc_condition_id: opportunity.btc_condition_id.clone(),
+                investment_amount: position_size,
+                units,
+                timestamp: std::time::Instant::now(),
+            };
+            pending.insert(trade_key, pending_trade);
+        }
         drop(pending);
         
         let mut trades = self.trades_executed.lock().await;
@@ -378,19 +390,31 @@ impl Trader {
         let cost_per_unit = f64::try_from(opportunity.total_cost).unwrap_or(1.0);
         let units = position_size / cost_per_unit;
         
+        // Use condition IDs as key - accumulate multiple trades in the same period
         let trade_key = format!("{}_{}", opportunity.eth_condition_id, opportunity.btc_condition_id);
-        let pending_trade = PendingTrade {
-            eth_token_id: opportunity.eth_up_token_id.clone(),
-            btc_token_id: opportunity.btc_down_token_id.clone(),
-            eth_condition_id: opportunity.eth_condition_id.clone(),
-            btc_condition_id: opportunity.btc_condition_id.clone(),
-            investment_amount: position_size,
-            units,
-            timestamp: std::time::Instant::now(),
-        };
         
         let mut pending = self.pending_trades.lock().await;
-        pending.insert(trade_key, pending_trade);
+        
+        // If we already have a trade for this period, accumulate it (add units and investment)
+        if let Some(existing_trade) = pending.get_mut(&trade_key) {
+            // Accumulate: add new units and investment to existing trade
+            existing_trade.units += units;
+            existing_trade.investment_amount += position_size;
+            info!("   📊 Accumulated trade: Total units: {:.2}, Total investment: ${:.2}", 
+                  existing_trade.units, existing_trade.investment_amount);
+        } else {
+            // First trade for this period - create new entry
+            let pending_trade = PendingTrade {
+                eth_token_id: opportunity.eth_up_token_id.clone(),
+                btc_token_id: opportunity.btc_down_token_id.clone(),
+                eth_condition_id: opportunity.eth_condition_id.clone(),
+                btc_condition_id: opportunity.btc_condition_id.clone(),
+                investment_amount: position_size,
+                units,
+                timestamp: std::time::Instant::now(),
+            };
+            pending.insert(trade_key, pending_trade);
+        }
         drop(pending);
         
         let mut trades = self.trades_executed.lock().await;
