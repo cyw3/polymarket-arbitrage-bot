@@ -26,21 +26,69 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
 
     info!("🚀 Starting Polymarket Arbitrage Bot");
-    info!("Mode: {}", if args.simulation { "SIMULATION" } else { "PRODUCTION" });
+    let is_simulation = args.is_simulation();
+    info!("Mode: {}", if is_simulation { "SIMULATION" } else { "PRODUCTION" });
 
     // Initialize API client
     let api = Arc::new(PolymarketApi::new(
         config.polymarket.gamma_api_url.clone(),
         config.polymarket.clob_api_url.clone(),
         config.polymarket.api_key.clone(),
+        config.polymarket.api_secret.clone(),
+        config.polymarket.api_passphrase.clone(),
+        config.polymarket.private_key.clone(),
     ));
+
+    // Fetch and display account balance
+    if !is_simulation {
+        info!("");
+        info!("═══════════════════════════════════════════════════════════");
+        info!("📊 Fetching Polymarket Account Balance...");
+        info!("═══════════════════════════════════════════════════════════");
+        
+        match api.get_balance().await {
+            Ok(balance) => {
+                use rust_decimal::Decimal;
+                use std::str::FromStr;
+                
+                let balance_decimal = Decimal::from_str(&balance.balance)
+                    .unwrap_or(Decimal::ZERO);
+                let allowance_decimal = Decimal::from_str(&balance.allowance)
+                    .unwrap_or(Decimal::ZERO);
+                
+                info!("💰 Proxy Wallet Balance: ${:.2} USDC", balance_decimal);
+                info!("🔓 Token Allowance: ${:.2} USDC", allowance_decimal);
+                
+                let max_position_decimal = rust_decimal::Decimal::from_f64_retain(config.trading.max_position_size)
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                
+                if balance_decimal < max_position_decimal {
+                    warn!("⚠️  WARNING: Account balance (${:.2}) is less than max_position_size (${:.2})", 
+                          balance_decimal, config.trading.max_position_size);
+                    warn!("⚠️  The bot may not be able to execute trades with current settings");
+                } else {
+                    let available_trades = (balance_decimal / max_position_decimal).floor();
+                    info!("✅ Balance sufficient for up to {:.0} trades at max_position_size", available_trades);
+                }
+                
+                info!("═══════════════════════════════════════════════════════════");
+                info!("");
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to fetch account balance: {}", e);
+                warn!("⚠️  Continuing anyway, but please verify your balance manually");
+                warn!("⚠️  Make sure your API credentials are correct and have proper permissions");
+                info!("");
+            }
+        }
+    } else {
+        info!("💡 Simulation mode: Skipping balance check");
+        info!("");
+    }
 
     // Get market data for ETH and BTC markets
     let (eth_market_data, btc_market_data) = 
         get_or_discover_markets(&api, &config).await?;
-
-    info!("ETH Market: {} (Condition ID: {})", eth_market_data.slug, eth_market_data.condition_id);
-    info!("BTC Market: {} (Condition ID: {})", btc_market_data.slug, btc_market_data.condition_id);
 
     // Initialize components
     let monitor = MarketMonitor::new(
@@ -55,7 +103,7 @@ async fn main() -> Result<()> {
     let trader = Trader::new(
         api.clone(),
         config.trading.clone(),
-        args.simulation,
+        is_simulation,
     );
 
     // Start monitoring
@@ -78,44 +126,85 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start a background task to detect new 15-minute periods and discover new markets
-    let monitor_for_period_check = monitor_arc.clone();
-    let api_for_period_check = api.clone();
+    // Start a background task to check emergency sell conditions periodically
+    // Check every 10 seconds to catch emergency conditions quickly
+    let trader_emergency = trader_clone.clone();
+    let monitor_emergency = monitor_arc.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10)); // Check every 10 seconds
         loop {
             interval.tick().await;
+            let current_market_timestamp = monitor_emergency.get_current_market_timestamp().await;
+            if let Err(e) = trader_emergency.check_emergency_sell(current_market_timestamp).await {
+                warn!("Error checking emergency sell conditions: {}", e);
+            }
+        }
+    });
+
+    // Start a background task to detect new 15-minute periods and discover new markets
+    // Uses the current market's timestamp to calculate exactly when the next period starts
+    let monitor_for_period_check = monitor_arc.clone();
+    let api_for_period_check = api.clone();
+    let trader_for_period_reset = trader_clone.clone();
+    tokio::spawn(async move {
+        loop {
+            // Get current market's timestamp from slug (e.g., "eth-updown-15m-1767796200" -> 1767796200)
+            let current_market_timestamp = monitor_for_period_check.get_current_market_timestamp().await;
             
-            // Check if we need to discover new markets (new period started)
-            if monitor_for_period_check.should_discover_new_markets().await {
-                info!("🔄 New 15-minute period detected! Discovering new markets...");
-                
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                
-                let mut seen_ids = std::collections::HashSet::new();
-                // Get current condition IDs to avoid duplicates
-                let (eth_id, btc_id) = monitor_for_period_check.get_current_condition_ids().await;
-                seen_ids.insert(eth_id);
-                seen_ids.insert(btc_id);
-                
-                // Discover new markets for current period
-                match discover_market(&api_for_period_check, "ETH", "eth", current_time, &mut seen_ids).await {
-                    Ok(eth_market) => {
-                        seen_ids.insert(eth_market.condition_id.clone());
-                        match discover_market(&api_for_period_check, "BTC", "btc", current_time, &mut seen_ids).await {
-                            Ok(btc_market) => {
-                                if let Err(e) = monitor_for_period_check.update_markets(eth_market, btc_market).await {
-                                    warn!("Failed to update markets: {}", e);
-                                }
+            // Calculate when the next period starts: current_market_timestamp + 15 minutes (900 seconds)
+            let next_period_timestamp = current_market_timestamp + 900;
+            
+            // Calculate how long to sleep until the next period
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            let sleep_duration = if next_period_timestamp > current_time {
+                next_period_timestamp - current_time
+            } else {
+                // If we're already past the next period (shouldn't happen, but safety check)
+                0
+            };
+            
+            info!("⏰ Current market period: {}, next period starts in {} seconds (at {})", 
+                current_market_timestamp, sleep_duration, next_period_timestamp);
+            
+            // Sleep until the next period starts
+            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_duration)).await;
+            
+            // Now discover new markets for the new period
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let current_period = (current_time / 900) * 900;
+            
+            info!("🔄 New 15-minute period detected! (Period: {}) Discovering new markets...", current_period);
+            
+            let mut seen_ids = std::collections::HashSet::new();
+            // Get current condition IDs to avoid duplicates
+            let (eth_id, btc_id) = monitor_for_period_check.get_current_condition_ids().await;
+            seen_ids.insert(eth_id);
+            seen_ids.insert(btc_id);
+            
+            // Discover new markets for current period
+            match discover_market(&api_for_period_check, "ETH", "eth", current_time, &mut seen_ids).await {
+                Ok(eth_market) => {
+                    seen_ids.insert(eth_market.condition_id.clone());
+                    match discover_market(&api_for_period_check, "BTC", "btc", current_time, &mut seen_ids).await {
+                        Ok(btc_market) => {
+                            if let Err(e) = monitor_for_period_check.update_markets(eth_market, btc_market).await {
+                                warn!("Failed to update markets: {}", e);
+                            } else {
+                                // Reset trade cooldown for new period
+                                trader_for_period_reset.reset_period().await;
                             }
-                            Err(e) => warn!("Failed to discover new BTC market: {}", e),
                         }
+                        Err(e) => warn!("Failed to discover new BTC market: {}", e),
                     }
-                    Err(e) => warn!("Failed to discover new ETH market: {}", e),
                 }
+                Err(e) => warn!("Failed to discover new ETH market: {}", e),
             }
         }
     });
@@ -182,6 +271,7 @@ async fn discover_market(
     let slug = format!("{}-updown-15m-{}", slug_prefix, rounded_time);
     
     if let Ok(market) = api.get_market_by_slug(&slug).await {
+
         if !seen_ids.contains(&market.condition_id) && market.active && !market.closed {
             log::info!("Found {} market by slug: {} | Condition ID: {}", market_name, market.slug, market.condition_id);
             return Ok(market);
@@ -203,3 +293,4 @@ async fn discover_market(
     
     anyhow::bail!("Could not find active {} 15-minute up/down market. Please set condition_id in config.json", market_name)
 }
+

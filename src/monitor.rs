@@ -102,6 +102,12 @@ impl MarketMonitor {
         (eth, btc)
     }
 
+    /// Get the current market's timestamp from the ETH market slug
+    pub async fn get_current_market_timestamp(&self) -> u64 {
+        let eth_market = self.eth_market.lock().await;
+        Self::extract_timestamp_from_slug(&eth_market.slug)
+    }
+
     /// Refresh market data once per period (15 minutes) to get token IDs
     async fn refresh_market_tokens(&self) -> Result<()> {
         // Check if we need to refresh (every 15 minutes = 900 seconds)
@@ -157,6 +163,18 @@ impl MarketMonitor {
         // Refresh token IDs if needed (once per 15-minute period)
         self.refresh_market_tokens().await?;
 
+        // Get market slugs to extract timestamps
+        let eth_market_guard = self.eth_market.lock().await;
+        let btc_market_guard = self.btc_market.lock().await;
+        let eth_slug = eth_market_guard.slug.clone();
+        let btc_slug = btc_market_guard.slug.clone();
+        drop(eth_market_guard);
+        drop(btc_market_guard);
+
+        // Extract market timestamp from slug (e.g., "eth-updown-15m-1767796200" -> 1767796200)
+        let eth_market_timestamp = Self::extract_timestamp_from_slug(&eth_slug);
+        let btc_market_timestamp = Self::extract_timestamp_from_slug(&btc_slug);
+
         let (eth_condition_id, btc_condition_id) = self.get_current_condition_ids().await;
         
         // Fetch prices for all tokens using the price endpoint
@@ -171,6 +189,36 @@ impl MarketMonitor {
             self.fetch_token_price(&btc_up_token_id, "BTC", "Up"),
             self.fetch_token_price(&btc_down_token_id, "BTC", "Down"),
         );
+
+        // Get current timestamp
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Log prices in the requested format
+        let eth_up_str = eth_up_price.as_ref()
+            .map(|p| format!("${:.2}", p.ask_price()))
+            .unwrap_or_else(|| "N/A".to_string());
+        let eth_down_str = eth_down_price.as_ref()
+            .map(|p| format!("${:.2}", p.ask_price()))
+            .unwrap_or_else(|| "N/A".to_string());
+        let btc_up_str = btc_up_price.as_ref()
+            .map(|p| format!("${:.2}", p.ask_price()))
+            .unwrap_or_else(|| "N/A".to_string());
+        let btc_down_str = btc_down_price.as_ref()
+            .map(|p| format!("${:.2}", p.ask_price()))
+            .unwrap_or_else(|| "N/A".to_string());
+
+        info!(
+            "ETH Up Token Price: {} Down Token Price: {} timestamp:{} market_timestamp:{}",
+            eth_up_str, eth_down_str, current_timestamp, eth_market_timestamp
+        );
+        info!(
+            "BTC Up Token Price: {} Down Token Price: {} timestamp:{} market_timestamp:{}",
+            btc_up_str, btc_down_str, current_timestamp, btc_market_timestamp
+        );
+        info!(""); // Empty line for readability
 
         let eth_market_data = MarketData {
             condition_id: eth_condition_id,
@@ -230,6 +278,18 @@ impl MarketMonitor {
         }
     }
 
+    /// Extract timestamp from market slug (e.g., "eth-updown-15m-1767796200" -> 1767796200)
+    pub fn extract_timestamp_from_slug(slug: &str) -> u64 {
+        // Slug format: {asset}-updown-15m-{timestamp}
+        // Try to extract the timestamp (last number after the last dash)
+        if let Some(last_dash) = slug.rfind('-') {
+            if let Ok(timestamp) = slug[last_dash + 1..].parse::<u64>() {
+                return timestamp;
+            }
+        }
+        // Fallback: return 0 if we can't parse
+        0
+    }
 
     /// Start monitoring markets continuously
     /// Returns a callback function that can be used to update markets when new period starts

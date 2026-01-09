@@ -35,8 +35,7 @@ impl ArbitrageDetector {
                 btc_down_price,
                 &snapshot.eth_market.condition_id,
                 &snapshot.btc_market.condition_id,
-                "ETH_UP",
-                "BTC_DOWN",
+                crate::models::ArbitrageStrategy::EthUpBtcDown,
             ) {
                 opportunities.push(opportunity);
             }
@@ -49,8 +48,7 @@ impl ArbitrageDetector {
                 btc_up_price,
                 &snapshot.eth_market.condition_id,
                 &snapshot.btc_market.condition_id,
-                "ETH_DOWN",
-                "BTC_UP",
+                crate::models::ArbitrageStrategy::EthDownBtcUp,
             ) {
                 opportunities.push(opportunity);
             }
@@ -63,10 +61,9 @@ impl ArbitrageDetector {
         &self,
         token1: &TokenPrice,
         token2: &TokenPrice,
-        _condition1: &str,
-        _condition2: &str,
-        _label1: &str,
-        _label2: &str,
+        condition1: &str,
+        condition2: &str,
+        strategy: crate::models::ArbitrageStrategy,
     ) -> Option<ArbitrageOpportunity> {
         let price1 = token1.ask_price();
         let price2 = token2.ask_price();
@@ -87,14 +84,15 @@ impl ArbitrageDetector {
             // Only return if profit meets threshold
             if expected_profit >= self.min_profit_threshold {
                 return Some(ArbitrageOpportunity {
-                    eth_up_price: price1,
-                    btc_down_price: price2,
+                    strategy,
+                    eth_token_price: price1,
+                    btc_token_price: price2,
                     total_cost,
                     expected_profit,
-                    eth_up_token_id: token1.token_id.clone(),
-                    btc_down_token_id: token2.token_id.clone(),
-                    eth_condition_id: _condition1.to_string(),
-                    btc_condition_id: _condition2.to_string(),
+                    eth_token_id: token1.token_id.clone(),
+                    btc_token_id: token2.token_id.clone(),
+                    eth_condition_id: condition1.to_string(),
+                    btc_condition_id: condition2.to_string(),
                 });
             }
         }

@@ -65,6 +65,7 @@ impl TokenPrice {
     }
 }
 
+/// Order structure for creating orders (before signing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub token_id: String,
@@ -75,11 +76,37 @@ pub struct OrderRequest {
     pub order_type: String, // "LIMIT" or "MARKET"
 }
 
+/// Signed order structure for posting to Polymarket
+/// According to Polymarket docs, orders must be signed with private key before posting
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedOrder {
+    // Order fields
+    #[serde(rename = "tokenID")]
+    pub token_id: String,
+    pub side: String, // "BUY" or "SELL"
+    pub size: String,
+    pub price: String,
+    #[serde(rename = "type")]
+    pub order_type: String, // "LIMIT" or "MARKET"
+    
+    // Signature fields (will be populated when signing)
+    pub signature: Option<String>,
+    pub signer: Option<String>, // Address derived from private key
+    pub nonce: Option<u64>,
+    pub expiration: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderResponse {
     pub order_id: Option<String>,
     pub status: String,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceResponse {
+    pub balance: String,
+    pub allowance: String,
 }
 
 #[derive(Debug, Clone)]
@@ -91,13 +118,20 @@ pub struct MarketData {
 }
 
 #[derive(Debug, Clone)]
+pub enum ArbitrageStrategy {
+    EthUpBtcDown,  // Strategy 1: Buy ETH Up + BTC Down
+    EthDownBtcUp,  // Strategy 2: Buy ETH Down + BTC Up
+}
+
+#[derive(Debug, Clone)]
 pub struct ArbitrageOpportunity {
-    pub eth_up_price: Decimal,
-    pub btc_down_price: Decimal,
+    pub strategy: ArbitrageStrategy,
+    pub eth_token_price: Decimal,  // Price of ETH token (Up or Down depending on strategy)
+    pub btc_token_price: Decimal,  // Price of BTC token (Down or Up depending on strategy)
     pub total_cost: Decimal,
     pub expected_profit: Decimal,
-    pub eth_up_token_id: String,
-    pub btc_down_token_id: String,
+    pub eth_token_id: String,  // Token ID for ETH token (Up or Down)
+    pub btc_token_id: String,  // Token ID for BTC token (Down or Up)
     pub eth_condition_id: String,
     pub btc_condition_id: String,
 }

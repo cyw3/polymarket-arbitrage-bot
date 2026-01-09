@@ -23,6 +23,8 @@ pub struct Trader {
     trades_executed: Arc<Mutex<u64>>,
     pending_trades: Arc<Mutex<HashMap<String, PendingTrade>>>, // Key: eth_condition_id + btc_condition_id
     market_cache: Arc<Mutex<HashMap<String, CachedMarketData>>>, // Key: condition_id, cache for 60 seconds
+    last_trade_time: Arc<Mutex<Option<Instant>>>, // Track when we last executed a trade
+    last_trade_profit_pct: Arc<Mutex<Option<f64>>>, // Track profit percentage of last trade
 }
 
 impl Trader {
@@ -35,6 +37,8 @@ impl Trader {
             trades_executed: Arc::new(Mutex::new(0)),
             pending_trades: Arc::new(Mutex::new(HashMap::new())),
             market_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_trade_time: Arc::new(Mutex::new(None)),
+            last_trade_profit_pct: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -240,43 +244,99 @@ impl Trader {
         actual_profit
     }
 
-    /// Execute arbitrage trade
+    /// Execute arbitrage trade (with smart filtering to avoid too many trades)
     pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
+        // Check if we should execute this trade based on cooldown and profit improvement
+        if !self.should_execute_trade(opportunity).await {
+            debug!("⏸️  Skipping trade - cooldown active or insufficient profit improvement");
+            return Ok(());
+        }
+        
         if self.simulation_mode {
             self.simulate_trade(opportunity).await
         } else {
             self.execute_real_trade(opportunity).await
         }
     }
+    
+    /// Determine if we should execute a trade based on:
+    /// 1. Cooldown period (minimum time between trades)
+    /// 2. Profit improvement (new opportunity must be significantly better)
+    async fn should_execute_trade(&self, opportunity: &ArbitrageOpportunity) -> bool {
+        let min_cooldown_seconds = self.config.trade_cooldown_seconds;
+        let min_profit_improvement_pct = self.config.min_profit_improvement_pct;
+        
+        let profit_pct = f64::try_from(opportunity.expected_profit / opportunity.total_cost * Decimal::from(100))
+            .unwrap_or(0.0);
+        
+        let last_time = self.last_trade_time.lock().await;
+        let last_profit_pct = self.last_trade_profit_pct.lock().await;
+        
+        // If we've never traded, allow it
+        if last_time.is_none() {
+            drop(last_time);
+            drop(last_profit_pct);
+            return true;
+        }
+        
+        let time_since_last = last_time.unwrap().elapsed();
+        let cooldown_passed = time_since_last.as_secs() >= min_cooldown_seconds;
+        
+        // If cooldown has passed, allow trade
+        if cooldown_passed {
+            drop(last_time);
+            drop(last_profit_pct);
+            return true;
+        }
+        
+        // If cooldown hasn't passed, only allow if profit is significantly better
+        if let Some(last_pct) = *last_profit_pct {
+            let improvement = (profit_pct - last_pct) / last_pct.max(0.01);
+            if improvement >= min_profit_improvement_pct {
+                drop(last_time);
+                drop(last_profit_pct);
+                info!("✅ Trade approved: Profit improvement {:.1}% ({:.2}% -> {:.2}%)", 
+                      improvement * 100.0, last_pct, profit_pct);
+                return true;
+            } else {
+                drop(last_time);
+                drop(last_profit_pct);
+                debug!("⏸️  Trade rejected: Profit improvement {:.1}% insufficient (need {:.0}%)", 
+                       improvement * 100.0, min_profit_improvement_pct * 100.0);
+                return false;
+            }
+        }
+        
+        drop(last_time);
+        drop(last_profit_pct);
+        false
+    }
 
     async fn simulate_trade(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
         info!(
             "🔍 SIMULATION: Arbitrage opportunity detected!"
         );
+        
+        // Show correct labels based on strategy
+        match opportunity.strategy {
+            ArbitrageStrategy::EthUpBtcDown => {
+                info!("   ETH Up Token Price: ${:.2}", opportunity.eth_token_price);
+                info!("   BTC Down Token Price: ${:.2}", opportunity.btc_token_price);
+            }
+            ArbitrageStrategy::EthDownBtcUp => {
+                info!("   ETH Down Token Price: ${:.2}", opportunity.eth_token_price);
+                info!("   BTC Up Token Price: ${:.2}", opportunity.btc_token_price);
+            }
+        }
+        
         info!(
-            "   ETH Up Token Price: ${:.4}",
-            opportunity.eth_up_price
-        );
-        info!(
-            "   BTC Down Token Price: ${:.4}",
-            opportunity.btc_down_price
-        );
-        info!(
-            "   Total Cost: ${:.4}",
+            "   Total Cost: ${:.2}",
             opportunity.total_cost
         );
         info!(
-            "   Expected Profit: ${:.4} ({:.2}%)",
+            "   Expected Profit: ${:.2} ({:.2}%)",
             opportunity.expected_profit,
             (opportunity.expected_profit / opportunity.total_cost) * Decimal::from(100)
-        );
-        info!(
-            "   ETH Token ID: {}",
-            opportunity.eth_up_token_id
-        );
-        info!(
-            "   BTC Token ID: {}",
-            opportunity.btc_down_token_id
         );
 
         // Calculate position size (total dollar amount to invest)
@@ -286,14 +346,26 @@ impl Trader {
         // Calculate how many units we're buying
         let cost_per_unit = f64::try_from(opportunity.total_cost).unwrap_or(1.0);
         let units = position_size / cost_per_unit;
-        info!("   Units: {:.2} (each unit = ${:.4}, so ${:.2} / ${:.4} = {:.2} units)", 
-              units, cost_per_unit, position_size, cost_per_unit, units);
-        info!("   ETH Up amount: ${:.2} ({} units × ${:.4})", 
-              units * f64::try_from(opportunity.eth_up_price).unwrap_or(0.0),
-              units, opportunity.eth_up_price);
-        info!("   BTC Down amount: ${:.2} ({} units × ${:.4})", 
-              units * f64::try_from(opportunity.btc_down_price).unwrap_or(0.0),
-              units, opportunity.btc_down_price);
+
+        // Show correct labels based on strategy
+        match opportunity.strategy {
+            ArbitrageStrategy::EthUpBtcDown => {
+                info!("   ETH Up amount: ${:.2} ({} units × ${:.4})", 
+                      units * f64::try_from(opportunity.eth_token_price).unwrap_or(0.0),
+                      units, opportunity.eth_token_price);
+                info!("   BTC Down amount: ${:.2} ({} units × ${:.4})", 
+                      units * f64::try_from(opportunity.btc_token_price).unwrap_or(0.0),
+                      units, opportunity.btc_token_price);
+            }
+            ArbitrageStrategy::EthDownBtcUp => {
+                info!("   ETH Down amount: ${:.2} ({} units × ${:.4})", 
+                      units * f64::try_from(opportunity.eth_token_price).unwrap_or(0.0),
+                      units, opportunity.eth_token_price);
+                info!("   BTC Up amount: ${:.2} ({} units × ${:.4})", 
+                      units * f64::try_from(opportunity.btc_token_price).unwrap_or(0.0),
+                      units, opportunity.btc_token_price);
+            }
+        }
 
         // In simulation mode, we track the trade and will calculate actual profit when markets close
         // Use condition IDs as key - accumulate multiple trades in the same period
@@ -311,8 +383,8 @@ impl Trader {
         } else {
             // First trade for this period - create new entry
             let pending_trade = PendingTrade {
-                eth_token_id: opportunity.eth_up_token_id.clone(),
-                btc_token_id: opportunity.btc_down_token_id.clone(),
+                eth_token_id: opportunity.eth_token_id.clone(),
+                btc_token_id: opportunity.btc_token_id.clone(),
                 eth_condition_id: opportunity.eth_condition_id.clone(),
                 btc_condition_id: opportunity.btc_condition_id.clone(),
                 investment_amount: position_size,
@@ -323,15 +395,22 @@ impl Trader {
         }
         drop(pending);
         
+        // Update last trade time and profit percentage
+        let profit_pct = f64::try_from(opportunity.expected_profit / opportunity.total_cost * Decimal::from(100))
+            .unwrap_or(0.0);
+        *self.last_trade_time.lock().await = Some(Instant::now());
+        *self.last_trade_profit_pct.lock().await = Some(profit_pct);
+        
         let mut trades = self.trades_executed.lock().await;
         *trades += 1;
         let trades_count = *trades;
         drop(trades);
 
         info!(
-            "   ✅ Simulated Trade Executed - Investment: ${:.2} | Expected Profit: ${:.4} | Trades: {}",
+            "   ✅ Simulated Trade Executed - Investment: ${:.2} | Expected Profit: ${:.2} ({:.2}%) | Trades: {}",
             position_size,
             f64::try_from(opportunity.expected_profit).unwrap_or(0.0) * units,
+            profit_pct,
             trades_count
         );
 
@@ -344,21 +423,21 @@ impl Trader {
         let position_size = self.calculate_position_size(opportunity);
         let size_str = format!("{:.6}", position_size);
 
-        // Place order for ETH Up token
+        // Place order for ETH token (Up or Down depending on strategy)
         let eth_order = OrderRequest {
-            token_id: opportunity.eth_up_token_id.clone(),
+            token_id: opportunity.eth_token_id.clone(),
             side: "BUY".to_string(),
             size: size_str.clone(),
-            price: opportunity.eth_up_price.to_string(),
+            price: opportunity.eth_token_price.to_string(),
             order_type: "LIMIT".to_string(),
         };
 
-        // Place order for BTC Down token
+        // Place order for BTC token (Down or Up depending on strategy)
         let btc_order = OrderRequest {
-            token_id: opportunity.btc_down_token_id.clone(),
+            token_id: opportunity.btc_token_id.clone(),
             side: "BUY".to_string(),
             size: size_str.clone(),
-            price: opportunity.btc_down_price.to_string(),
+            price: opportunity.btc_token_price.to_string(),
             order_type: "LIMIT".to_string(),
         };
 
@@ -368,21 +447,43 @@ impl Trader {
             self.api.place_order(&btc_order)
         );
 
-        match eth_result {
-            Ok(response) => {
-                info!("ETH Up order placed: {:?}", response);
+        // Log with correct labels based on strategy
+        match opportunity.strategy {
+            ArbitrageStrategy::EthUpBtcDown => {
+                match eth_result {
+                    Ok(response) => {
+                        info!("ETH Up order placed: {:?}", response);
+                    }
+                    Err(e) => {
+                        warn!("Failed to place ETH Up order: {}", e);
+                    }
+                }
+                match btc_result {
+                    Ok(response) => {
+                        info!("BTC Down order placed: {:?}", response);
+                    }
+                    Err(e) => {
+                        warn!("Failed to place BTC Down order: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                warn!("Failed to place ETH Up order: {}", e);
-            }
-        }
-
-        match btc_result {
-            Ok(response) => {
-                info!("BTC Down order placed: {:?}", response);
-            }
-            Err(e) => {
-                warn!("Failed to place BTC Down order: {}", e);
+            ArbitrageStrategy::EthDownBtcUp => {
+                match eth_result {
+                    Ok(response) => {
+                        info!("ETH Down order placed: {:?}", response);
+                    }
+                    Err(e) => {
+                        warn!("Failed to place ETH Down order: {}", e);
+                    }
+                }
+                match btc_result {
+                    Ok(response) => {
+                        info!("BTC Up order placed: {:?}", response);
+                    }
+                    Err(e) => {
+                        warn!("Failed to place BTC Up order: {}", e);
+                    }
+                }
             }
         }
 
@@ -405,8 +506,8 @@ impl Trader {
         } else {
             // First trade for this period - create new entry
             let pending_trade = PendingTrade {
-                eth_token_id: opportunity.eth_up_token_id.clone(),
-                btc_token_id: opportunity.btc_down_token_id.clone(),
+                eth_token_id: opportunity.eth_token_id.clone(),
+                btc_token_id: opportunity.btc_token_id.clone(),
                 eth_condition_id: opportunity.eth_condition_id.clone(),
                 btc_condition_id: opportunity.btc_condition_id.clone(),
                 investment_amount: position_size,
@@ -417,15 +518,22 @@ impl Trader {
         }
         drop(pending);
         
+        // Update last trade time and profit percentage
+        let profit_pct = f64::try_from(opportunity.expected_profit / opportunity.total_cost * Decimal::from(100))
+            .unwrap_or(0.0);
+        *self.last_trade_time.lock().await = Some(Instant::now());
+        *self.last_trade_profit_pct.lock().await = Some(profit_pct);
+        
         let mut trades = self.trades_executed.lock().await;
         *trades += 1;
         let trades_count = *trades;
         drop(trades);
 
         info!(
-            "✅ Real Trade Executed - Investment: ${:.2} | Expected Profit: ${:.4} | Trades: {}",
+            "✅ Real Trade Executed - Investment: ${:.2} | Expected Profit: ${:.4} ({:.2}%) | Trades: {}",
             position_size,
             f64::try_from(opportunity.expected_profit).unwrap_or(0.0) * units,
+            profit_pct,
             trades_count
         );
 
@@ -452,6 +560,201 @@ impl Trader {
         // - position_size = 133.33 * 0.75 = $100 (capped at max_size)
         // - This means we buy $100 worth of tokens total ($50 ETH Up + $50 BTC Down)
         position_size
+    }
+
+    /// Reset trade cooldown (call when a new 15-minute period starts)
+    pub async fn reset_period(&self) {
+        *self.last_trade_time.lock().await = None;
+        *self.last_trade_profit_pct.lock().await = None;
+        info!("🔄 Trade cooldown reset for new period");
+    }
+
+    /// Check emergency sell conditions for all pending trades
+    /// Emergency sell triggers when ALL 3 conditions are met:
+    /// 1. Both purchased tokens' prices are under emergency_sell_both_tokens_threshold
+    /// 2. One token's price is under emergency_sell_one_token_threshold
+    /// 3. Time remaining is less than emergency_sell_time_remaining_seconds
+    pub async fn check_emergency_sell(&self, current_market_timestamp: u64) -> Result<()> {
+        let pending = self.pending_trades.lock().await;
+        let pending_count = pending.len();
+        drop(pending);
+        
+        if pending_count == 0 {
+            return Ok(());
+        }
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Calculate time remaining until market closes (market starts at timestamp, closes at timestamp + 900 seconds)
+        let market_end_timestamp = current_market_timestamp + 900;
+        let time_remaining = if market_end_timestamp > current_time {
+            market_end_timestamp - current_time
+        } else {
+            0
+        };
+
+        let time_remaining_ok = time_remaining < self.config.emergency_sell_time_remaining_seconds;
+        
+        if !time_remaining_ok {
+            // Time condition not met, skip checking prices
+            return Ok(());
+        }
+
+        // Get current prices for all pending trades
+        // First, collect trades that need emergency selling
+        let trades_to_sell = {
+            let pending = self.pending_trades.lock().await;
+            let mut trades_to_sell = Vec::new();
+            
+            for (key, trade) in pending.iter() {
+                // Fetch current prices for both tokens
+                let eth_price_result = self.api.get_price(&trade.eth_token_id, "SELL").await;
+                let btc_price_result = self.api.get_price(&trade.btc_token_id, "SELL").await;
+                
+                let (eth_price, btc_price) = match (eth_price_result, btc_price_result) {
+                    (Ok(eth), Ok(btc)) => (eth, btc),
+                    _ => {
+                        debug!("⚠️  Could not fetch prices for emergency sell check on trade {}", key);
+                        continue;
+                    }
+                };
+
+                let eth_price_f64 = f64::try_from(eth_price).unwrap_or(0.0);
+                let btc_price_f64 = f64::try_from(btc_price).unwrap_or(0.0);
+
+                // Check condition 1: Both tokens under threshold
+                let both_under_threshold = eth_price_f64 < self.config.emergency_sell_both_tokens_threshold
+                    && btc_price_f64 < self.config.emergency_sell_both_tokens_threshold;
+                
+                // Check condition 2: One token under lower threshold
+                let one_under_lower = eth_price_f64 < self.config.emergency_sell_one_token_threshold
+                    || btc_price_f64 < self.config.emergency_sell_one_token_threshold;
+                
+                // All 3 conditions must be met
+                if both_under_threshold && one_under_lower && time_remaining_ok {
+                    info!("🚨 EMERGENCY SELL TRIGGERED for trade {}:", key);
+                    info!("   ETH Token Price: ${:.2} (threshold: ${:.2})", 
+                          eth_price_f64, self.config.emergency_sell_both_tokens_threshold);
+                    info!("   BTC Token Price: ${:.2} (threshold: ${:.2})", 
+                          btc_price_f64, self.config.emergency_sell_both_tokens_threshold);
+                    info!("   One token under ${:.2}: {}", 
+                          self.config.emergency_sell_one_token_threshold,
+                          if eth_price_f64 < self.config.emergency_sell_one_token_threshold { "ETH" } else { "BTC" });
+                    info!("   Time remaining: {} seconds (threshold: {} seconds)", 
+                          time_remaining, self.config.emergency_sell_time_remaining_seconds);
+                    
+                    // Clone trade data for selling outside the lock
+                    trades_to_sell.push((key.clone(), trade.clone()));
+                }
+            }
+            
+            trades_to_sell
+        };
+        
+        // Now sell the trades (outside the lock)
+        let mut to_remove = Vec::new();
+        for (key, trade) in trades_to_sell {
+            if let Err(e) = self.emergency_sell_trade(&trade).await {
+                warn!("Error executing emergency sell for trade {}: {}", key, e);
+            } else {
+                to_remove.push(key);
+            }
+        }
+        
+        // Remove sold trades from pending
+        if !to_remove.is_empty() {
+            let mut pending = self.pending_trades.lock().await;
+            for key in to_remove {
+                pending.remove(&key);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Emergency sell all holdings for a specific trade
+    async fn emergency_sell_trade(&self, trade: &PendingTrade) -> Result<()> {
+        info!("💸 Executing emergency sell for {} units...", trade.units);
+        
+        if self.simulation_mode {
+            // In simulation mode, calculate loss based on current prices
+            let eth_price_result = self.api.get_price(&trade.eth_token_id, "SELL").await;
+            let btc_price_result = self.api.get_price(&trade.btc_token_id, "SELL").await;
+            
+            let (eth_price, btc_price) = match (eth_price_result, btc_price_result) {
+                (Ok(eth), Ok(btc)) => (eth, btc),
+                _ => {
+                    warn!("⚠️  Could not fetch prices for emergency sell calculation");
+                    return Ok(());
+                }
+            };
+
+            let eth_price_f64 = f64::try_from(eth_price).unwrap_or(0.0);
+            let btc_price_f64 = f64::try_from(btc_price).unwrap_or(0.0);
+            
+            let sell_value = (eth_price_f64 + btc_price_f64) * trade.units;
+            let loss = trade.investment_amount - sell_value;
+            
+            let mut total = self.total_profit.lock().await;
+            *total -= loss; // Subtract loss from total profit
+            let total_profit = *total;
+            drop(total);
+            
+            info!("   💰 Emergency Sell - Sold {} units at ETH: ${:.4}, BTC: ${:.4}", 
+                  trade.units, eth_price_f64, btc_price_f64);
+            info!("   📉 Loss: ${:.4} | Total Profit: ${:.2}", loss, total_profit);
+        } else {
+            // In production mode, actually sell the tokens
+            // Get current bid prices (what we get when selling)
+            let eth_price_result = self.api.get_price(&trade.eth_token_id, "SELL").await;
+            let btc_price_result = self.api.get_price(&trade.btc_token_id, "SELL").await;
+            
+            let (eth_bid_price, btc_bid_price) = match (eth_price_result, btc_price_result) {
+                (Ok(eth), Ok(btc)) => (eth, btc),
+                _ => {
+                    warn!("⚠️  Could not fetch prices for emergency sell, skipping");
+                    return Ok(());
+                }
+            };
+            
+            let eth_sell_order = OrderRequest {
+                token_id: trade.eth_token_id.clone(),
+                side: "SELL".to_string(),
+                size: format!("{:.6}", trade.units),
+                price: eth_bid_price.to_string(),
+                order_type: "LIMIT".to_string(),
+            };
+            
+            let btc_sell_order = OrderRequest {
+                token_id: trade.btc_token_id.clone(),
+                side: "SELL".to_string(),
+                size: format!("{:.6}", trade.units),
+                price: btc_bid_price.to_string(),
+                order_type: "LIMIT".to_string(),
+            };
+            
+            let (eth_result, btc_result) = tokio::join!(
+                self.api.place_order(&eth_sell_order),
+                self.api.place_order(&btc_sell_order)
+            );
+            
+            match eth_result {
+                Ok(_) => info!("✅ Emergency sold {} units of ETH token at ${:.4}", 
+                              trade.units, f64::try_from(eth_bid_price).unwrap_or(0.0)),
+                Err(e) => warn!("⚠️  Failed to emergency sell ETH token: {}", e),
+            }
+            
+            match btc_result {
+                Ok(_) => info!("✅ Emergency sold {} units of BTC token at ${:.4}", 
+                              trade.units, f64::try_from(btc_bid_price).unwrap_or(0.0)),
+                Err(e) => warn!("⚠️  Failed to emergency sell BTC token: {}", e),
+            }
+        }
+        
+        Ok(())
     }
 
     pub async fn get_stats(&self) -> (f64, u64) {
