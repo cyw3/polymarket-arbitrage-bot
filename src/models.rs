@@ -109,6 +109,14 @@ pub struct BalanceResponse {
     pub allowance: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedeemResponse {
+    pub success: bool,
+    pub message: Option<String>,
+    pub transaction_hash: Option<String>,
+    pub amount_redeemed: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketData {
     pub condition_id: String,

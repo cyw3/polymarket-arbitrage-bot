@@ -39,50 +39,33 @@ async fn main() -> Result<()> {
         config.polymarket.private_key.clone(),
     ));
 
-    // Fetch and display account balance
+    // Authenticate with Polymarket CLOB API at startup
+    // This verifies credentials and creates an authenticated client
+    // Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds)
     if !is_simulation {
         info!("");
         info!("═══════════════════════════════════════════════════════════");
-        info!("📊 Fetching Polymarket Account Balance...");
+        info!("🔐 Authenticating with Polymarket CLOB API...");
         info!("═══════════════════════════════════════════════════════════");
         
-        match api.get_balance().await {
-            Ok(balance) => {
-                use rust_decimal::Decimal;
-                use std::str::FromStr;
-                
-                let balance_decimal = Decimal::from_str(&balance.balance)
-                    .unwrap_or(Decimal::ZERO);
-                let allowance_decimal = Decimal::from_str(&balance.allowance)
-                    .unwrap_or(Decimal::ZERO);
-                
-                info!("💰 Proxy Wallet Balance: ${:.2} USDC", balance_decimal);
-                info!("🔓 Token Allowance: ${:.2} USDC", allowance_decimal);
-                
-                let max_position_decimal = rust_decimal::Decimal::from_f64_retain(config.trading.max_position_size)
-                    .unwrap_or(rust_decimal::Decimal::ZERO);
-                
-                if balance_decimal < max_position_decimal {
-                    warn!("⚠️  WARNING: Account balance (${:.2}) is less than max_position_size (${:.2})", 
-                          balance_decimal, config.trading.max_position_size);
-                    warn!("⚠️  The bot may not be able to execute trades with current settings");
-                } else {
-                    let available_trades = (balance_decimal / max_position_decimal).floor();
-                    info!("✅ Balance sufficient for up to {:.0} trades at max_position_size", available_trades);
-                }
-                
+        match api.authenticate().await {
+            Ok(_) => {
+                info!("✅ Authentication successful!");
+                info!("   Using private key and API credentials for signing");
                 info!("═══════════════════════════════════════════════════════════");
                 info!("");
             }
             Err(e) => {
-                warn!("⚠️  Failed to fetch account balance: {}", e);
-                warn!("⚠️  Continuing anyway, but please verify your balance manually");
-                warn!("⚠️  Make sure your API credentials are correct and have proper permissions");
+                warn!("⚠️  Failed to authenticate: {}", e);
+                warn!("⚠️  The bot will continue, but order placement may fail");
+                warn!("⚠️  Please verify your credentials:");
+                warn!("     1. private_key (hex string)");
+                warn!("     2. api_key, api_secret, api_passphrase");
                 info!("");
             }
         }
     } else {
-        info!("💡 Simulation mode: Skipping balance check");
+        info!("💡 Simulation mode: Skipping authentication");
         info!("");
     }
 

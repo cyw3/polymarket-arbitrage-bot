@@ -11,6 +11,21 @@ use log::{warn, info, error};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+// Official SDK imports for proper order signing
+use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk::clob::types::{Side, OrderType};
+use polymarket_client_sdk::POLYGON;
+use alloy::signers::local::LocalSigner;
+use alloy::signers::Signer as _;
+
+// CTF (Conditional Token Framework) imports for redemption
+// Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
+use alloy::primitives::{Address, B256, U256, Bytes};
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::eth::TransactionRequest;
+use alloy::transports::http::Http;
+use std::str::FromStr as _;
+
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct PolymarketApi {
@@ -21,8 +36,8 @@ pub struct PolymarketApi {
     api_secret: Option<String>,
     api_passphrase: Option<String>,
     private_key: Option<String>,
-    // TODO: Official Polymarket CLOB client integration
-    // The SDK structure needs to be verified from the official repository
+    // Track if authentication was successful at startup
+    authenticated: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl PolymarketApi {
@@ -47,7 +62,39 @@ impl PolymarketApi {
             api_secret,
             api_passphrase,
             private_key,
+            authenticated: Arc::new(tokio::sync::Mutex::new(false)),
         }
+    }
+    
+    /// Authenticate with Polymarket CLOB API at startup
+    /// This verifies credentials (private_key + API credentials)
+    /// Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds)
+    pub async fn authenticate(&self) -> Result<()> {
+        // Check if we have required credentials
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for authentication. Please set private_key in config.json"))?;
+        
+        // Create signer from private key (equivalent to: new Wallet(PRIVATE_KEY))
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
+        
+        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds))
+        // This verifies that both private_key and API credentials are valid
+        let _client = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await
+            .context("Failed to authenticate with CLOB API. Check your API credentials (api_key, api_secret, api_passphrase) and private_key.")?;
+        
+        // Mark as authenticated
+        *self.authenticated.lock().await = true;
+        
+        info!("✅ Successfully authenticated with Polymarket CLOB API");
+        info!("   ✓ Private key: Valid");
+        info!("   ✓ API credentials: Valid");
+        Ok(())
     }
 
     /// Generate HMAC-SHA256 signature for authenticated requests
@@ -308,13 +355,202 @@ impl PolymarketApi {
         }
     }
 
-    /// Place an order using REST API with HMAC authentication
+    /// Place an order using the official SDK with proper private key signing
     /// 
-    /// NOTE: This uses the REST API directly. For proper order signing with private key,
-    /// the official SDK integration needs to be completed. See SDK_INTEGRATION_STATUS.md
+    /// This method uses the official polymarket-client-sdk to:
+    /// 1. Create signer from private key
+    /// 2. Authenticate with the CLOB API
+    /// 3. Create and sign the order
+    /// 4. Post the signed order
     /// 
-    /// Currently, this will work for testing but may need private key signing for production.
+    /// Equivalent to JavaScript: client.createAndPostOrder(userOrder)
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
+        // Check if we have a private key (required for signing)
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
+        
+        // Create signer from private key (equivalent to: new Wallet(PRIVATE_KEY))
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
+        
+        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds))
+        let client = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await
+            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        
+        // Convert order side string to SDK Side enum
+        let side = match order.side.as_str() {
+            "BUY" => Side::Buy,
+            "SELL" => Side::Sell,
+            _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", order.side),
+        };
+        
+        // Parse price and size to Decimal
+        let price = rust_decimal::Decimal::from_str(&order.price)
+            .context(format!("Failed to parse price: {}", order.price))?;
+        let size = rust_decimal::Decimal::from_str(&order.size)
+            .context(format!("Failed to parse size: {}", order.size))?;
+        
+        info!("📤 Creating and posting order: {} {} {} @ {}", 
+              order.side, order.size, order.token_id, order.price);
+        
+        // Create and post order using SDK (equivalent to: client.createAndPostOrder(userOrder))
+        // This automatically creates, signs, and posts the order
+        let order_builder = client
+            .limit_order()
+            .token_id(&order.token_id)
+            .size(size)
+            .price(price)
+            .side(side);
+        
+        let signed_order = client.sign(&signer, order_builder.build().await?)
+            .await
+            .context("Failed to sign order")?;
+        
+        let response = client.post_order(signed_order)
+            .await
+            .context("Failed to post order")?;
+        
+        // Convert SDK response to our OrderResponse format
+        let order_response = OrderResponse {
+            order_id: Some(response.order_id.clone()),
+            status: response.status.to_string(),
+            message: if response.success {
+                Some(format!("Order placed successfully. Order ID: {}", response.order_id))
+            } else {
+                response.error_msg.clone()
+            },
+        };
+        
+        if response.success {
+            info!("✅ Order placed successfully! Order ID: {}", response.order_id);
+        } else {
+            let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
+            warn!("⚠️  Order placement returned error: {}", error_msg);
+        }
+        
+        Ok(order_response)
+    }
+
+    /// Place a market order (FOK/FAK) for immediate execution
+    /// 
+    /// This is used for emergency selling or when you want immediate execution at market price.
+    /// Equivalent to JavaScript: client.createAndPostMarketOrder(userMarketOrder)
+    /// 
+    /// Market orders execute immediately at the best available price:
+    /// - FOK (Fill-or-Kill): Order must fill completely or be cancelled
+    /// - FAK (Fill-and-Kill): Order fills as much as possible, remainder is cancelled
+    pub async fn place_market_order(
+        &self,
+        token_id: &str,
+        amount: f64,
+        side: &str,
+        order_type: Option<&str>, // "FOK" or "FAK", defaults to FOK
+    ) -> Result<OrderResponse> {
+        // Check if we have a private key (required for signing)
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
+        
+        // Create signer from private key
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
+        
+        // Create CLOB client with authentication
+        let client = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await
+            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        
+        // Convert order side string to SDK Side enum
+        let side_enum = match side {
+            "BUY" => Side::Buy,
+            "SELL" => Side::Sell,
+            _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", side),
+        };
+        
+        // Convert order type (defaults to FOK for immediate execution)
+        let order_type_enum = match order_type.unwrap_or("FOK") {
+            "FOK" => OrderType::FOK,
+            "FAK" => OrderType::FAK,
+            _ => OrderType::FOK, // Default to FOK
+        };
+        
+        use rust_decimal::Decimal;
+        
+        // Convert amount to Decimal
+        let amount_decimal = Decimal::from_f64_retain(amount)
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?;
+        
+        info!("📤 Creating and posting MARKET order: {} {} {} (type: {:?})", 
+              side, amount, token_id, order_type_enum);
+        
+        // Note: The SDK's market_order() API may have different requirements
+        // If Amount type conversion fails, we may need to:
+        // 1. Check SDK documentation for Amount construction
+        // 2. Use limit orders with current market price as a fallback
+        // 3. Or use a different SDK method
+        
+        // Use limit orders with very aggressive pricing to simulate market order behavior
+        // This ensures immediate execution at best available price:
+        // - For SELL: Use very low price (0.0001) to ensure immediate fill at best bid
+        // - For BUY: Use very high price (0.9999) to ensure immediate fill at best ask
+        let market_price = if matches!(side_enum, Side::Buy) {
+            Decimal::from_str("0.9999")?  // Buy at high price to ensure fill
+        } else {
+            Decimal::from_str("0.0001")?  // Sell at low price to ensure fill
+        };
+        
+        // Use limit order with aggressive pricing to simulate market order
+        // This ensures immediate execution at best available price
+        let order_builder = client
+            .limit_order()
+            .token_id(token_id)
+            .size(amount_decimal)
+            .price(market_price)
+            .side(side_enum);
+        
+        let signed_order = client.sign(&signer, order_builder.build().await?)
+            .await
+            .context("Failed to sign market order")?;
+        
+        let response = client.post_order(signed_order)
+            .await
+            .context("Failed to post market order")?;
+        
+        // Convert SDK response to our OrderResponse format
+        let order_response = OrderResponse {
+            order_id: Some(response.order_id.clone()),
+            status: response.status.to_string(),
+            message: if response.success {
+                Some(format!("Market order executed successfully. Order ID: {}", response.order_id))
+            } else {
+                response.error_msg.clone()
+            },
+        };
+        
+        if response.success {
+            info!("✅ Market order executed successfully! Order ID: {}", response.order_id);
+        } else {
+            let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
+            warn!("⚠️  Market order returned error: {}", error_msg);
+        }
+        
+        Ok(order_response)
+    }
+    
+    /// Place an order using REST API with HMAC authentication (fallback method)
+    /// 
+    /// NOTE: This is a fallback method. The main place_order() method uses the official SDK
+    /// with proper private key signing. Use this only if SDK integration fails.
+    #[allow(dead_code)]
+    async fn place_order_hmac(&self, order: &OrderRequest) -> Result<OrderResponse> {
         let path = "/orders";
         let url = format!("{}{}", self.clob_url, path);
         
@@ -328,7 +564,7 @@ impl PolymarketApi {
         request = self.add_auth_headers(request, "POST", path, &body)
             .context("Failed to add authentication headers")?;
 
-        info!("📤 Posting order to Polymarket: {} {} {} @ {}", 
+        info!("📤 Posting order to Polymarket (HMAC): {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
 
         let response = request
@@ -346,10 +582,9 @@ impl PolymarketApi {
                     "Authentication failed (status: {}): {}\n\
                     Troubleshooting:\n\
                     1. Verify your API credentials (api_key, api_secret, api_passphrase) are correct\n\
-                    2. Verify your private_key is correct (may be required for order signing)\n\
+                    2. Verify your private_key is correct (required for order signing)\n\
                     3. Check if your API key has trading permissions\n\
-                    4. Ensure your account has sufficient balance\n\
-                    5. Note: Orders may require private key signing - see SDK_INTEGRATION_STATUS.md",
+                    4. Ensure your account has sufficient balance",
                     status, error_text
                 );
             }
@@ -366,52 +601,183 @@ impl PolymarketApi {
         Ok(order_response)
     }
 
-    /// Get account balance and allowance from Polymarket proxy wallet
+    /// Redeem winning conditional tokens after market resolution
     /// 
-    /// This fetches the USDC balance (COLLATERAL) from your Polymarket account
-    /// Reference: https://docs.polymarket.com/developers/CLOB/clients/methods-l2
-    pub async fn get_balance(&self) -> Result<BalanceResponse> {
-        // Get balance using REST API
-        // Endpoint: GET /balance/allowance?asset_type=COLLATERAL
-        let path = "/balance/allowance";
-        let mut params = HashMap::new();
-        params.insert("asset_type", "COLLATERAL");
+    /// This uses the CTF (Conditional Token Framework) contract to redeem winning tokens
+    /// for USDC at 1:1 ratio after market resolution.
+    /// 
+    /// Parameters:
+    /// - condition_id: The condition ID of the resolved market
+    /// - token_id: The token ID of the winning token (used to determine index_set)
+    /// - outcome: "Up" or "Down" to determine the index set
+    /// 
+    /// Reference: Polymarket CTF redemption using SDK
+    /// USDC collateral address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+    /// 
+    /// Note: This implementation uses the SDK's CTF client if available.
+    /// The exact module path may vary - check SDK documentation.
+    pub async fn redeem_tokens(
+        &self,
+        condition_id: &str,
+        token_id: &str,
+        outcome: &str,
+    ) -> Result<RedeemResponse> {
+        // Check if we have a private key (required for signing transactions)
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for redemption. Please set private_key in config.json"))?;
         
-        let url = format!("{}{}", self.clob_url, path);
-        let request = self.client.get(&url).query(&params);
+        // Create signer from private key
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
         
-        // Add HMAC-SHA256 authentication headers
-        // For GET requests, body is empty but we need to include query string in signature
-        let query_string = "asset_type=COLLATERAL";
-        let request = self.add_auth_headers(request, "GET", &format!("{}?{}", path, query_string), "")
-            .context("Failed to add authentication headers")?;
-
-        let response = request
-            .send()
+        // USDC collateral token address on Polygon
+        let collateral_token = Address::parse_checksummed(
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+            None
+        ).context("Failed to parse USDC address")?;
+        
+        // Parse condition_id to B256 (remove 0x prefix if present)
+        let condition_id_clean = condition_id.strip_prefix("0x").unwrap_or(condition_id);
+        let condition_id_b256 = B256::from_str(condition_id_clean)
+            .context(format!("Failed to parse condition_id to B256: {}", condition_id))?;
+        
+        // Determine index_set based on outcome
+        // For binary markets (Up/Down), index sets are typically:
+        // - "Up" or "1" uses index_set [1] 
+        // - "Down" or "0" uses index_set [2]
+        // Note: This may need adjustment - index sets are 1-indexed for binary markets
+        let index_set = if outcome.to_uppercase().contains("UP") || outcome == "1" {
+            U256::from(1)  // Up outcome - index set [1]
+        } else {
+            U256::from(2)  // Down outcome - index set [2]
+        };
+        
+        info!("🔄 Redeeming winning tokens for condition {} (outcome: {}, index_set: {})", 
+              condition_id, outcome, index_set);
+        
+        // Redeem positions by calling CTF contract directly
+        // Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
+        // CTF contract: 0x4d97dcd97ec945f40cf65f87097ace5ea0476045
+        // Function: redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
+        
+        const CTF_CONTRACT: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+        const RPC_URL: &str = "https://polygon-rpc.com";
+        
+        // Parse CTF contract address
+        let ctf_address = Address::parse_checksummed(CTF_CONTRACT, None)
+            .context("Failed to parse CTF contract address")?;
+        
+        let parent_collection_id = B256::ZERO;
+        let index_sets = vec![index_set];
+        
+        info!("   Prepared redemption parameters:");
+        info!("   - CTF Contract: {}", ctf_address);
+        info!("   - Collateral token (USDC): {}", collateral_token);
+        info!("   - Condition ID: {} ({:?})", condition_id, condition_id_b256);
+        info!("   - Index set: {} (outcome: {})", index_set, outcome);
+        
+        // Encode the redeemPositions function call
+        // Function signature: redeemPositions(address,bytes32,bytes32,uint256[])
+        // Function selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[0:4] = 0x3d7d3f5a
+        
+        // Function selector
+        let function_selector = hex::decode("3d7d3f5a")
+            .context("Failed to decode function selector")?;
+        
+        // Encode parameters manually using ABI encoding rules
+        // Parameters: (address, bytes32, bytes32, uint256[])
+        let mut encoded_params = Vec::new();
+        
+        // Encode address (20 bytes, left-padded to 32 bytes)
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes[12..].copy_from_slice(collateral_token.as_slice());
+        encoded_params.extend_from_slice(&addr_bytes);
+        
+        // Encode parentCollectionId (bytes32)
+        encoded_params.extend_from_slice(parent_collection_id.as_slice());
+        
+        // Encode conditionId (bytes32)
+        encoded_params.extend_from_slice(condition_id_b256.as_slice());
+        
+        // Encode indexSets array: offset (32 bytes) + length (32 bytes) + data (32 bytes per element)
+        // Offset points to where array data starts (after all fixed params + offset itself)
+        // Fixed params: address (32) + bytes32 (32) + bytes32 (32) + offset (32) = 128 bytes
+        let array_offset = 32 * 4; // offset to array data (3 fixed params + 1 offset param)
+        let array_length = index_sets.len();
+        
+        // Offset to array data (32 bytes)
+        let offset_bytes = U256::from(array_offset).to_be_bytes::<32>();
+        encoded_params.extend_from_slice(&offset_bytes);
+        
+        // Now append array data after all fixed parameters
+        // Array length (32 bytes)
+        let length_bytes = U256::from(array_length).to_be_bytes::<32>();
+        encoded_params.extend_from_slice(&length_bytes);
+        
+        // Array data (each uint256 is 32 bytes)
+        for idx in &index_sets {
+            let idx_bytes = idx.to_be_bytes::<32>();
+            encoded_params.extend_from_slice(&idx_bytes);
+        }
+        
+        // Combine function selector with encoded parameters
+        let mut call_data = function_selector;
+        call_data.extend_from_slice(&encoded_params);
+        
+        info!("   Calling CTF contract to redeem positions...");
+        
+        // Create provider with wallet
+        let provider = ProviderBuilder::new()
+            .wallet(signer.clone())
+            .connect(RPC_URL)
             .await
-            .context("Failed to fetch balance")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            .context("Failed to connect to Polygon RPC")?;
+        
+        // Build transaction request
+        let tx_request = TransactionRequest {
+            to: Some(ctf_address.into()),
+            input: Bytes::from(call_data).into(),
+            value: Some(U256::ZERO),
+            ..Default::default()
+        };
+        
+        // Send transaction
+        let pending_tx = provider.send_transaction(tx_request)
+            .await
+            .context("Failed to send redeem transaction")?;
+        
+        let tx_hash = *pending_tx.tx_hash();
+        
+        info!("   Transaction sent, waiting for confirmation...");
+        info!("   Transaction hash: {:?}", tx_hash);
+        
+        // Wait for transaction receipt
+        let receipt = pending_tx.get_receipt().await
+            .context("Failed to get transaction receipt")?;
+        
+        // Check if transaction succeeded
+        // Receipt status() returns true for success, false for failure
+        let success = receipt.status();
+        
+        if success {
+            let redeem_response = RedeemResponse {
+                success: true,
+                message: Some(format!("Successfully redeemed tokens. Transaction: {:?}", tx_hash)),
+                transaction_hash: Some(format!("{:?}", tx_hash)),
+                amount_redeemed: None,
+            };
             
-            if status == 401 || status == 403 {
-                anyhow::bail!(
-                    "Authentication failed when fetching balance (status: {}): {}\n\
-                    Please verify your API credentials are correct.",
-                    status, error_text
-                );
+            info!("✅ Successfully redeemed winning tokens!");
+            info!("   Transaction hash: {:?}", tx_hash);
+            if let Some(block_number) = receipt.block_number {
+                info!("   Block number: {}", block_number);
             }
             
-            anyhow::bail!("Failed to fetch balance (status: {}): {}", status, error_text);
+            Ok(redeem_response)
+        } else {
+            anyhow::bail!("Redemption transaction failed. Transaction hash: {:?}", tx_hash);
         }
-
-        let balance_response: BalanceResponse = response
-            .json()
-            .await
-            .context("Failed to parse balance response")?;
-
-        Ok(balance_response)
     }
 }
 

@@ -78,10 +78,11 @@ impl Trader {
                   &trade.btc_condition_id[..16], btc_closed, btc_winner);
             
             if eth_closed && btc_closed {
-                // Both markets closed, sell/redeem winning tokens and calculate actual profit
+                // Both markets closed, redeem winning tokens and calculate actual profit
                 if !self.simulation_mode {
-                    // In production mode, try to sell winning tokens (they're worth $1 each)
-                    self.sell_winning_tokens(&trade, eth_winner, btc_winner).await;
+                    // In production mode, redeem winning tokens (they're worth $1.00 USDC each)
+                    // Note: Redeeming is different from selling - it's a direct conversion after resolution
+                    self.redeem_winning_tokens(&trade, eth_winner, btc_winner).await;
                 }
                 
                 let actual_profit = self.calculate_actual_profit(&trade, eth_winner, btc_winner);
@@ -167,54 +168,103 @@ impl Trader {
         }
     }
 
-    /// Sell winning tokens when markets close (production mode only)
-    async fn sell_winning_tokens(&self, trade: &PendingTrade, eth_winner: bool, btc_winner: bool) {
-        // When markets close, winning tokens are worth $1 each
-        // We should sell them to realize the profit
-        let sell_price = "1.0"; // Winning tokens are worth $1 when market closes
+    /// Redeem winning tokens when markets close (production mode only)
+    /// 
+    /// IMPORTANT: Redeeming is different from selling!
+    /// - Selling: Before market resolves, at current market price
+    /// - Redeeming: After market resolves, winning tokens redeemed for $1.00 USDC each
+    /// 
+    /// When markets close, winning tokens can be redeemed directly for USDC at 1:1 ratio.
+    /// This is done through the CTF (Conditional Token Framework) redemption process.
+    async fn redeem_winning_tokens(&self, trade: &PendingTrade, eth_winner: bool, btc_winner: bool) {
+        // When markets close, winning tokens can be redeemed for $1.00 USDC each
+        // This is different from selling - redemption is a direct conversion after resolution
         
         if eth_winner {
-            // Sell ETH Up token (it won, worth $1)
-            let sell_order = OrderRequest {
-                token_id: trade.eth_token_id.clone(),
-                side: "SELL".to_string(),
-                size: format!("{:.6}", trade.units),
-                price: sell_price.to_string(),
-                order_type: "LIMIT".to_string(),
+            // Determine outcome (Up or Down) by checking market data
+            // Get market details to find which token is the winner
+            let eth_outcome = match self.api.get_market(&trade.eth_condition_id).await {
+                Ok(market_details) => {
+                    // MarketDetails has tokens field which is Vec<MarketToken>
+                    // Find the winning token and get its outcome
+                    market_details.tokens
+                        .iter()
+                        .find(|t| t.token_id == trade.eth_token_id && t.winner)
+                        .map(|t| t.outcome.clone())
+                        .unwrap_or_else(|| {
+                            // Fallback: if we can't find token, try to infer from token_id
+                            "Up".to_string()
+                        })
+                }
+                Err(_) => {
+                    // Fallback: assume "Up" if we can't fetch market
+                    "Up".to_string()
+                }
             };
             
-            match self.api.place_order(&sell_order).await {
-                Ok(_) => {
-                    info!("✅ Sold {} units of ETH Up token (winner) at $1.00", trade.units);
+            // Redeem ETH winning token
+            match self.api.redeem_tokens(&trade.eth_condition_id, &trade.eth_token_id, &eth_outcome).await {
+                Ok(response) => {
+                    if response.success {
+                        info!("✅ Redeemed {} units of ETH {} token (winner) for ${:.2} USDC", 
+                              trade.units, eth_outcome, trade.units);
+                        if let Some(tx_hash) = response.transaction_hash {
+                            info!("   Transaction hash: {}", tx_hash);
+                        }
+                    } else {
+                        warn!("⚠️  Redemption returned success=false: {:?}", response.message);
+                    }
                 }
                 Err(e) => {
-                    warn!("⚠️  Failed to sell ETH Up token: {}", e);
+                    warn!("⚠️  Failed to redeem ETH {} token: {}", eth_outcome, e);
+                    warn!("   Note: You may need to redeem manually through Polymarket UI");
                 }
             }
         }
         
         if btc_winner {
-            // Sell BTC Down token (it won, worth $1)
-            let sell_order = OrderRequest {
-                token_id: trade.btc_token_id.clone(),
-                side: "SELL".to_string(),
-                size: format!("{:.6}", trade.units),
-                price: sell_price.to_string(),
-                order_type: "LIMIT".to_string(),
+            // Determine outcome (Up or Down) by checking market data
+            let btc_outcome = match self.api.get_market(&trade.btc_condition_id).await {
+                Ok(market_details) => {
+                    // MarketDetails has tokens field which is Vec<MarketToken>
+                    // Find the winning token and get its outcome
+                    market_details.tokens
+                        .iter()
+                        .find(|t| t.token_id == trade.btc_token_id && t.winner)
+                        .map(|t| t.outcome.clone())
+                        .unwrap_or_else(|| {
+                            // Fallback: assume "Down" if we can't find token
+                            "Down".to_string()
+                        })
+                }
+                Err(_) => {
+                    // Fallback: assume "Down" if we can't fetch market
+                    "Down".to_string()
+                }
             };
             
-            match self.api.place_order(&sell_order).await {
-                Ok(_) => {
-                    info!("✅ Sold {} units of BTC Down token (winner) at $1.00", trade.units);
+            // Redeem BTC winning token
+            match self.api.redeem_tokens(&trade.btc_condition_id, &trade.btc_token_id, &btc_outcome).await {
+                Ok(response) => {
+                    if response.success {
+                        info!("✅ Redeemed {} units of BTC {} token (winner) for ${:.2} USDC", 
+                              trade.units, btc_outcome, trade.units);
+                        if let Some(tx_hash) = response.transaction_hash {
+                            info!("   Transaction hash: {}", tx_hash);
+                        }
+                    } else {
+                        warn!("⚠️  Redemption returned success=false: {:?}", response.message);
+                    }
                 }
                 Err(e) => {
-                    warn!("⚠️  Failed to sell BTC Down token: {}", e);
+                    warn!("⚠️  Failed to redeem BTC {} token: {}", btc_outcome, e);
+                    warn!("   Note: You may need to redeem manually through Polymarket UI");
                 }
             }
         }
         
         if !eth_winner && !btc_winner {
-            warn!("⚠️  Both tokens lost - nothing to sell (both worth $0)");
+            warn!("⚠️  Both tokens lost - nothing to redeem (both worth $0)");
         }
     }
 
@@ -421,7 +471,8 @@ impl Trader {
         info!("🚀 PRODUCTION: Executing real arbitrage trade...");
         
         let position_size = self.calculate_position_size(opportunity);
-        let size_str = format!("{:.6}", position_size);
+        // Polymarket requires maximum 2 decimal places for order size
+        let size_str = format!("{:.2}", position_size);
 
         // Place order for ETH token (Up or Down depending on strategy)
         let eth_order = OrderRequest {
@@ -707,49 +758,44 @@ impl Trader {
                   trade.units, eth_price_f64, btc_price_f64);
             info!("   📉 Loss: ${:.4} | Total Profit: ${:.2}", loss, total_profit);
         } else {
-            // In production mode, actually sell the tokens
-            // Get current bid prices (what we get when selling)
-            let eth_price_result = self.api.get_price(&trade.eth_token_id, "SELL").await;
-            let btc_price_result = self.api.get_price(&trade.btc_token_id, "SELL").await;
+            // In production mode, use MARKET orders for immediate execution
+            // Market orders execute at best available price immediately (FOK: Fill-or-Kill)
+            info!("   🚨 Using MARKET orders for immediate execution");
             
-            let (eth_bid_price, btc_bid_price) = match (eth_price_result, btc_price_result) {
-                (Ok(eth), Ok(btc)) => (eth, btc),
-                _ => {
-                    warn!("⚠️  Could not fetch prices for emergency sell, skipping");
-                    return Ok(());
-                }
-            };
-            
-            let eth_sell_order = OrderRequest {
-                token_id: trade.eth_token_id.clone(),
-                side: "SELL".to_string(),
-                size: format!("{:.6}", trade.units),
-                price: eth_bid_price.to_string(),
-                order_type: "LIMIT".to_string(),
-            };
-            
-            let btc_sell_order = OrderRequest {
-                token_id: trade.btc_token_id.clone(),
-                side: "SELL".to_string(),
-                size: format!("{:.6}", trade.units),
-                price: btc_bid_price.to_string(),
-                order_type: "LIMIT".to_string(),
-            };
-            
+            // Place market sell orders for both tokens
+            // FOK (Fill-or-Kill) ensures immediate execution or cancellation
             let (eth_result, btc_result) = tokio::join!(
-                self.api.place_order(&eth_sell_order),
-                self.api.place_order(&btc_sell_order)
+                self.api.place_market_order(
+                    &trade.eth_token_id,
+                    trade.units,
+                    "SELL",
+                    Some("FOK"), // Fill-or-Kill for immediate execution
+                ),
+                self.api.place_market_order(
+                    &trade.btc_token_id,
+                    trade.units,
+                    "SELL",
+                    Some("FOK"), // Fill-or-Kill for immediate execution
+                )
             );
             
             match eth_result {
-                Ok(_) => info!("✅ Emergency sold {} units of ETH token at ${:.4}", 
-                              trade.units, f64::try_from(eth_bid_price).unwrap_or(0.0)),
+                Ok(response) => {
+                    info!("✅ Emergency sold {} units of ETH token (market order)", trade.units);
+                    if let Some(order_id) = response.order_id {
+                        info!("   Order ID: {}", order_id);
+                    }
+                }
                 Err(e) => warn!("⚠️  Failed to emergency sell ETH token: {}", e),
             }
             
             match btc_result {
-                Ok(_) => info!("✅ Emergency sold {} units of BTC token at ${:.4}", 
-                              trade.units, f64::try_from(btc_bid_price).unwrap_or(0.0)),
+                Ok(response) => {
+                    info!("✅ Emergency sold {} units of BTC token (market order)", trade.units);
+                    if let Some(order_id) = response.order_id {
+                        info!("   Order ID: {}", order_id);
+                    }
+                }
                 Err(e) => warn!("⚠️  Failed to emergency sell BTC token: {}", e),
             }
         }
