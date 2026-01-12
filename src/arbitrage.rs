@@ -6,13 +6,15 @@ use rust_decimal_macros::dec;
 #[derive(Clone)]
 pub struct ArbitrageDetector {
     min_profit_threshold: Decimal,
+    min_time_remaining_to_trade_seconds: u64,
 }
 
 impl ArbitrageDetector {
-    pub fn new(min_profit_threshold: f64) -> Self {
+    pub fn new(min_profit_threshold: f64, min_time_remaining_to_trade_seconds: u64) -> Self {
         Self {
             min_profit_threshold: Decimal::from_f64_retain(min_profit_threshold)
                 .unwrap_or(dec!(0.01)),
+            min_time_remaining_to_trade_seconds,
         }
     }
 
@@ -21,6 +23,13 @@ impl ArbitrageDetector {
     /// when total cost < $1
     pub fn detect_opportunities(&self, snapshot: &MarketSnapshot) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
+
+        // Filter 1: Only trade when configured time or less remain
+        // Default: 600 seconds (10 minutes) - means bot waits 5 minutes before trading
+        if snapshot.time_remaining_seconds > self.min_time_remaining_to_trade_seconds {
+            // Too early in the period, skip trading
+            return opportunities;
+        }
 
         // Get prices from both markets
         let eth_up = snapshot.eth_market.up_token.as_ref();
@@ -70,10 +79,18 @@ impl ArbitrageDetector {
         let total_cost = price1 + price2;
         let dollar = dec!(1.0);
         let min_price_threshold = dec!(0.6);
+        let min_higher_token_price = dec!(0.65);
 
         // Safety filter: Don't trade if both tokens are below $0.6 (rug case)
         // This avoids cases where both markets might go against us
         if price1 < min_price_threshold && price2 < min_price_threshold {
+            return None;
+        }
+
+        // Filter: Higher-priced token must be >= $0.65
+        // This ensures we're not trading when both tokens are too cheap
+        let higher_price = price1.max(price2);
+        if higher_price < min_higher_token_price {
             return None;
         }
 

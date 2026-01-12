@@ -13,10 +13,12 @@ use tokio::sync::Mutex;
 
 // Official SDK imports for proper order signing
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_client_sdk::clob::types::{Side, OrderType};
+use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::POLYGON;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
+use alloy::primitives::Address as AlloyAddress;
 
 // CTF (Conditional Token Framework) imports for redemption
 // Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
@@ -36,6 +38,9 @@ pub struct PolymarketApi {
     api_secret: Option<String>,
     api_passphrase: Option<String>,
     private_key: Option<String>,
+    // Proxy wallet configuration (for Polymarket proxy wallet)
+    proxy_wallet_address: Option<String>,
+    signature_type: Option<u8>, // 0 = EOA, 1 = Proxy, 2 = GnosisSafe
     // Track if authentication was successful at startup
     authenticated: Arc<tokio::sync::Mutex<bool>>,
 }
@@ -48,6 +53,8 @@ impl PolymarketApi {
         api_secret: Option<String>,
         api_passphrase: Option<String>,
         private_key: Option<String>,
+        proxy_wallet_address: Option<String>,
+        signature_type: Option<u8>,
     ) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -62,13 +69,16 @@ impl PolymarketApi {
             api_secret,
             api_passphrase,
             private_key,
+            proxy_wallet_address,
+            signature_type,
             authenticated: Arc::new(tokio::sync::Mutex::new(false)),
         }
     }
     
+
     /// Authenticate with Polymarket CLOB API at startup
     /// This verifies credentials (private_key + API credentials)
-    /// Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds)
+    /// Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress)
     pub async fn authenticate(&self) -> Result<()> {
         // Check if we have required credentials
         let private_key = self.private_key.as_ref()
@@ -79,11 +89,44 @@ impl PolymarketApi {
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
             .with_chain_id(Some(POLYGON));
         
-        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds))
-        // This verifies that both private_key and API credentials are valid
-        let _client = ClobClient::new(&self.clob_url, ClobConfig::default())
+        // Build authentication builder with proxy wallet support
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
-            .authentication_builder(&signer)
+            .authentication_builder(&signer);
+        
+        // Configure proxy wallet if provided
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
+            
+            auth_builder = auth_builder.funder(funder_address);
+            
+            // Set signature type based on config or default to Proxy
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => {
+                    warn!("⚠️  proxy_wallet_address is set but signature_type is EOA. Defaulting to Proxy.");
+                    SignatureType::Proxy
+                },
+                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            
+            auth_builder = auth_builder.signature_type(sig_type);
+            info!("🔐 Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            // If signature type is set but no proxy wallet, validate it's EOA
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        
+        // Authenticate (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
+        // This verifies that both private_key and API credentials are valid
+        let _client = auth_builder
             .authenticate()
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials (api_key, api_secret, api_passphrase) and private_key.")?;
@@ -94,6 +137,11 @@ impl PolymarketApi {
         info!("✅ Successfully authenticated with Polymarket CLOB API");
         info!("   ✓ Private key: Valid");
         info!("   ✓ API credentials: Valid");
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            info!("   ✓ Proxy wallet: {}", proxy_addr);
+        } else {
+            info!("   ✓ Trading account: EOA (private key account)");
+        }
         Ok(())
     }
 
@@ -374,10 +422,39 @@ impl PolymarketApi {
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
             .with_chain_id(Some(POLYGON));
         
-        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds))
-        let client = ClobClient::new(&self.clob_url, ClobConfig::default())
+        // Build authentication builder with proxy wallet support
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
-            .authentication_builder(&signer)
+            .authentication_builder(&signer);
+        
+        // Configure proxy wallet if provided
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
+            
+            auth_builder = auth_builder.funder(funder_address);
+            
+            // Set signature type based on config or default to Proxy
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
+                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            // If signature type is set but no proxy wallet, validate it's EOA
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        
+        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
+        let client = auth_builder
             .authenticate()
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
@@ -411,27 +488,56 @@ impl PolymarketApi {
             .await
             .context("Failed to sign order")?;
         
-        let response = client.post_order(signed_order)
-            .await
-            .context("Failed to post order")?;
+        // Post order and capture detailed error information
+        let response = match client.post_order(signed_order).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Log the full error details for debugging
+                error!("❌ Failed to post order. Error details: {:?}", e);
+                anyhow::bail!(
+                    "Failed to post order: {}\n\
+                    \n\
+                    Troubleshooting:\n\
+                    1. Check if you have sufficient USDC balance\n\
+                    2. Verify the token_id is valid and active\n\
+                    3. Check if the price is within valid range\n\
+                    4. Ensure your API credentials have trading permissions\n\
+                    5. Verify the order size meets minimum requirements",
+                    e
+                );
+            }
+        };
+        
+        // Check if the response indicates failure even if the request succeeded
+        if !response.success {
+            let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
+            error!("❌ Order rejected by API: {}", error_msg);
+            anyhow::bail!(
+                "Order was rejected: {}\n\
+                \n\
+                Order details:\n\
+                - Token ID: {}\n\
+                - Side: {}\n\
+                - Size: {}\n\
+                - Price: {}\n\
+                \n\
+                Common issues:\n\
+                1. Insufficient balance or allowance\n\
+                2. Invalid token ID or market closed\n\
+                3. Price out of range\n\
+                4. Size below minimum or above maximum",
+                error_msg, order.token_id, order.side, order.size, order.price
+            );
+        }
         
         // Convert SDK response to our OrderResponse format
         let order_response = OrderResponse {
             order_id: Some(response.order_id.clone()),
             status: response.status.to_string(),
-            message: if response.success {
-                Some(format!("Order placed successfully. Order ID: {}", response.order_id))
-            } else {
-                response.error_msg.clone()
-            },
+            message: Some(format!("Order placed successfully. Order ID: {}", response.order_id)),
         };
         
-        if response.success {
-            info!("✅ Order placed successfully! Order ID: {}", response.order_id);
-        } else {
-            let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
-            warn!("⚠️  Order placement returned error: {}", error_msg);
-        }
+        info!("✅ Order placed successfully! Order ID: {}", response.order_id);
         
         Ok(order_response)
     }
@@ -460,10 +566,39 @@ impl PolymarketApi {
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
             .with_chain_id(Some(POLYGON));
         
-        // Create CLOB client with authentication
-        let client = ClobClient::new(&self.clob_url, ClobConfig::default())
+        // Build authentication builder with proxy wallet support
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
-            .authentication_builder(&signer)
+            .authentication_builder(&signer);
+        
+        // Configure proxy wallet if provided
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
+            
+            auth_builder = auth_builder.funder(funder_address);
+            
+            // Set signature type based on config or default to Proxy
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
+                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            // If signature type is set but no proxy wallet, validate it's EOA
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        
+        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
+        let client = auth_builder
             .authenticate()
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
@@ -482,30 +617,34 @@ impl PolymarketApi {
             _ => OrderType::FOK, // Default to FOK
         };
         
-        use rust_decimal::Decimal;
+        use rust_decimal::{Decimal, RoundingStrategy};
+        use rust_decimal::prelude::*;
         
-        // Convert amount to Decimal
+        // Convert amount to Decimal and round to 2 decimal places (Polymarket requirement)
         let amount_decimal = Decimal::from_f64_retain(amount)
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?
+            .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
         
         info!("📤 Creating and posting MARKET order: {} {} {} (type: {:?})", 
-              side, amount, token_id, order_type_enum);
+              side, amount_decimal, token_id, order_type_enum);
         
-        // Note: The SDK's market_order() API may have different requirements
-        // If Amount type conversion fails, we may need to:
-        // 1. Check SDK documentation for Amount construction
-        // 2. Use limit orders with current market price as a fallback
-        // 3. Or use a different SDK method
-        
-        // Use limit orders with very aggressive pricing to simulate market order behavior
-        // This ensures immediate execution at best available price:
-        // - For SELL: Use very low price (0.0001) to ensure immediate fill at best bid
-        // - For BUY: Use very high price (0.9999) to ensure immediate fill at best ask
+        // For market orders, we need to use the current market price to respect tick size requirements
+        // Fetch the current best price from the market:
+        // - For SELL: Use best bid price (what we get when selling)
+        // - For BUY: Use best ask price (what we pay when buying)
         let market_price = if matches!(side_enum, Side::Buy) {
-            Decimal::from_str("0.9999")?  // Buy at high price to ensure fill
+            // For BUY orders, get the current ask price (what we pay to buy)
+            self.get_price(token_id, "BUY")
+                .await
+                .context("Failed to fetch current market price for BUY order. Cannot create market order without current price.")?
         } else {
-            Decimal::from_str("0.0001")?  // Sell at low price to ensure fill
+            // For SELL orders, get the current bid price (what we get when selling)
+            self.get_price(token_id, "SELL")
+                .await
+                .context("Failed to fetch current market price for SELL order. Cannot create market order without current price.")?
         };
+        
+        info!("   Using current market price: ${:.4} for {} order", market_price, side);
         
         // Use limit order with aggressive pricing to simulate market order
         // This ensures immediate execution at best available price

@@ -49,6 +49,16 @@ pub struct PolymarketConfig {
     /// Private key for signing orders (optional, but may be required for order placement)
     /// Format: hex string (with or without 0x prefix) or raw private key
     pub private_key: Option<String>,
+    /// Proxy wallet address (Polymarket proxy wallet address where your balance is)
+    /// If set, the bot will trade using this proxy wallet instead of the EOA (private key account)
+    /// Format: Ethereum address (with or without 0x prefix)
+    pub proxy_wallet_address: Option<String>,
+    /// Signature type for authentication (optional, defaults to EOA if not set)
+    /// 0 = EOA (Externally Owned Account - private key account)
+    /// 1 = Proxy (Polymarket proxy wallet)
+    /// 2 = GnosisSafe (Gnosis Safe wallet)
+    /// If proxy_wallet_address is set, this should be 1 (Proxy)
+    pub signature_type: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +73,14 @@ pub struct TradingConfig {
     pub emergency_sell_both_tokens_threshold: f64,
     pub emergency_sell_one_token_threshold: f64,
     pub emergency_sell_time_remaining_seconds: u64,
+    /// Minimum time remaining (in seconds) before bot starts trading in a period
+    /// Bot will only trade when time_remaining <= this value
+    /// Default: 600 (10 minutes) - means bot waits 5 minutes before trading (15 min period - 10 min = 5 min wait)
+    pub min_time_remaining_to_trade_seconds: u64,
+    /// Time threshold (in seconds) for clear condition sell
+    /// When time remaining <= this value, bot will check if outcome is clear and sell losing token
+    /// Default: 90 (90 seconds)
+    pub clear_condition_sell_time_threshold_seconds: u64,
 }
 
 impl Default for Config {
@@ -76,6 +94,8 @@ impl Default for Config {
                 api_secret: None,
                 api_passphrase: None,
                 private_key: None,
+                proxy_wallet_address: None,
+                signature_type: None,
             },
             trading: TradingConfig {
                 min_profit_threshold: 0.01,
@@ -88,6 +108,8 @@ impl Default for Config {
                 emergency_sell_both_tokens_threshold: 0.3,
                 emergency_sell_one_token_threshold: 0.1,
                 emergency_sell_time_remaining_seconds: 120,
+                min_time_remaining_to_trade_seconds: 600, // 10 minutes (wait 5 minutes before trading)
+                clear_condition_sell_time_threshold_seconds: 90, // 90 seconds
             },
         }
     }

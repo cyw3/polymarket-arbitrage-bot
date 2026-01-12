@@ -24,6 +24,7 @@ pub struct MarketSnapshot {
     pub eth_market: MarketData,
     pub btc_market: MarketData,
     pub timestamp: std::time::Instant,
+    pub time_remaining_seconds: u64, // Time remaining in the current 15-minute period
 }
 
 impl MarketMonitor {
@@ -196,6 +197,40 @@ impl MarketMonitor {
             .unwrap()
             .as_secs();
 
+        // Calculate remaining time for each market (15 minutes = 900 seconds per period)
+        const PERIOD_DURATION: u64 = 900; // 15 minutes in seconds
+        let eth_period_end = eth_market_timestamp + PERIOD_DURATION;
+        let btc_period_end = btc_market_timestamp + PERIOD_DURATION;
+        
+        let eth_remaining_secs = if eth_period_end > current_timestamp {
+            eth_period_end - current_timestamp
+        } else {
+            0
+        };
+        let btc_remaining_secs = if btc_period_end > current_timestamp {
+            btc_period_end - current_timestamp
+        } else {
+            0
+        };
+        
+        // Format remaining time as "Xm Ys"
+        let format_remaining_time = |secs: u64| -> String {
+            if secs == 0 {
+                "0s".to_string()
+            } else {
+                let minutes = secs / 60;
+                let seconds = secs % 60;
+                if minutes > 0 {
+                    format!("{}m {}s", minutes, seconds)
+                } else {
+                    format!("{}s", seconds)
+                }
+            }
+        };
+        
+        let eth_remaining_str = format_remaining_time(eth_remaining_secs);
+        let btc_remaining_str = format_remaining_time(btc_remaining_secs);
+
         // Log prices in the requested format
         let eth_up_str = eth_up_price.as_ref()
             .map(|p| format!("${:.2}", p.ask_price()))
@@ -211,12 +246,12 @@ impl MarketMonitor {
             .unwrap_or_else(|| "N/A".to_string());
 
         info!(
-            "ETH Up Token Price: {} Down Token Price: {} timestamp:{} market_timestamp:{}",
-            eth_up_str, eth_down_str, current_timestamp, eth_market_timestamp
+            "ETH Up Token Price: {} Down Token Price: {} remaining time:{} market_timestamp:{}",
+            eth_up_str, eth_down_str, eth_remaining_str, eth_market_timestamp
         );
         info!(
-            "BTC Up Token Price: {} Down Token Price: {} timestamp:{} market_timestamp:{}",
-            btc_up_str, btc_down_str, current_timestamp, btc_market_timestamp
+            "BTC Up Token Price: {} Down Token Price: {} remaining time:{} market_timestamp:{}",
+            btc_up_str, btc_down_str, btc_remaining_str, btc_market_timestamp
         );
         info!(""); // Empty line for readability
 
@@ -234,10 +269,12 @@ impl MarketMonitor {
             down_token: btc_down_price,
         };
 
+        // Use ETH market's remaining time (both markets should have the same period)
         Ok(MarketSnapshot {
             eth_market: eth_market_data,
             btc_market: btc_market_data,
             timestamp: std::time::Instant::now(),
+            time_remaining_seconds: eth_remaining_secs,
         })
     }
 

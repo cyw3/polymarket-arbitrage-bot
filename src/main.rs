@@ -37,6 +37,8 @@ async fn main() -> Result<()> {
         config.polymarket.api_secret.clone(),
         config.polymarket.api_passphrase.clone(),
         config.polymarket.private_key.clone(),
+        config.polymarket.proxy_wallet_address.clone(),
+        config.polymarket.signature_type,
     ));
 
     // Authenticate with Polymarket CLOB API at startup
@@ -82,7 +84,10 @@ async fn main() -> Result<()> {
     );
     let monitor_arc = Arc::new(monitor);
 
-    let detector = ArbitrageDetector::new(config.trading.min_profit_threshold);
+    let detector = ArbitrageDetector::new(
+        config.trading.min_profit_threshold,
+        config.trading.min_time_remaining_to_trade_seconds,
+    );
     let trader = Trader::new(
         api.clone(),
         config.trading.clone(),
@@ -118,6 +123,12 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
             let current_market_timestamp = monitor_emergency.get_current_market_timestamp().await;
+            // Check clear condition sell (when 90s remain, sell losing token if outcome is clear)
+            if let Err(e) = trader_emergency.check_clear_condition_sell(current_market_timestamp).await {
+                warn!("Error checking clear condition sell: {}", e);
+            }
+            
+            // Check emergency sell conditions
             if let Err(e) = trader_emergency.check_emergency_sell(current_market_timestamp).await {
                 warn!("Error checking emergency sell conditions: {}", e);
             }
@@ -171,12 +182,22 @@ async fn main() -> Result<()> {
             seen_ids.insert(eth_id);
             seen_ids.insert(btc_id);
             
+            // Get previous period's condition IDs BEFORE updating to new markets
+            let (previous_eth_id, previous_btc_id) = monitor_for_period_check.get_current_condition_ids().await;
+            
             // Discover new markets for current period
             match discover_market(&api_for_period_check, "ETH", "eth", current_time, &mut seen_ids).await {
                 Ok(eth_market) => {
                     seen_ids.insert(eth_market.condition_id.clone());
                     match discover_market(&api_for_period_check, "BTC", "btc", current_time, &mut seen_ids).await {
                         Ok(btc_market) => {
+                            // Check previous period's markets BEFORE updating to new markets
+                            info!("🔍 Checking if previous period's markets are closed...");
+                            if let Err(e) = trader_for_period_reset.check_previous_period_markets(&previous_eth_id, &previous_btc_id).await {
+                                warn!("Error checking previous period markets: {}", e);
+                            }
+                            
+                            // Now update to new markets
                             if let Err(e) = monitor_for_period_check.update_markets(eth_market, btc_market).await {
                                 warn!("Failed to update markets: {}", e);
                             } else {
