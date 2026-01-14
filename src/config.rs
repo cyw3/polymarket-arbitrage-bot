@@ -77,10 +77,14 @@ pub struct TradingConfig {
     /// Bot will only trade when time_remaining <= this value
     /// Default: 600 (10 minutes) - means bot waits 5 minutes before trading (15 min period - 10 min = 5 min wait)
     pub min_time_remaining_to_trade_seconds: u64,
-    /// Time threshold (in seconds) for clear condition sell
-    /// When time remaining <= this value, bot will check if outcome is clear and sell losing token
-    /// Default: 90 (90 seconds)
-    pub clear_condition_sell_time_threshold_seconds: u64,
+    /// Time threshold (in seconds) for danger signal check
+    /// When time remaining < this value, bot will check if both tokens are below danger_signal_min_token_price
+    /// Default: 480 (8 minutes)
+    pub danger_signal_time_threshold_seconds: u64,
+    /// Minimum token price threshold for danger signal
+    /// If time remaining < danger_signal_time_threshold_seconds AND both tokens < this price, reject trade
+    /// Default: 0.45 ($0.45)
+    pub danger_signal_min_token_price: f64,
 }
 
 impl Default for Config {
@@ -109,7 +113,8 @@ impl Default for Config {
                 emergency_sell_one_token_threshold: 0.1,
                 emergency_sell_time_remaining_seconds: 120,
                 min_time_remaining_to_trade_seconds: 600, // 10 minutes (wait 5 minutes before trading)
-                clear_condition_sell_time_threshold_seconds: 90, // 90 seconds
+                danger_signal_time_threshold_seconds: 480, // 8 minutes
+                danger_signal_min_token_price: 0.45, // $0.45
             },
         }
     }

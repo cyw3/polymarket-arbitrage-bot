@@ -87,6 +87,8 @@ async fn main() -> Result<()> {
     let detector = ArbitrageDetector::new(
         config.trading.min_profit_threshold,
         config.trading.min_time_remaining_to_trade_seconds,
+        config.trading.danger_signal_time_threshold_seconds,
+        config.trading.danger_signal_min_token_price,
     );
     let trader = Trader::new(
         api.clone(),
@@ -123,10 +125,6 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
             let current_market_timestamp = monitor_emergency.get_current_market_timestamp().await;
-            // Check clear condition sell (when 90s remain, sell losing token if outcome is clear)
-            if let Err(e) = trader_emergency.check_clear_condition_sell(current_market_timestamp).await {
-                warn!("Error checking clear condition sell: {}", e);
-            }
             
             // Check emergency sell conditions
             if let Err(e) = trader_emergency.check_emergency_sell(current_market_timestamp).await {
@@ -140,6 +138,7 @@ async fn main() -> Result<()> {
     let monitor_for_period_check = monitor_arc.clone();
     let api_for_period_check = api.clone();
     let trader_for_period_reset = trader_clone.clone();
+    let detector_for_period_reset = detector.clone();
     tokio::spawn(async move {
         loop {
             // Get current market's timestamp from slug (e.g., "eth-updown-15m-1767796200" -> 1767796200)
@@ -203,6 +202,8 @@ async fn main() -> Result<()> {
                             } else {
                                 // Reset trade cooldown for new period
                                 trader_for_period_reset.reset_period().await;
+                                // Reset danger signal flag for new period
+                                detector_for_period_reset.reset_period(current_period).await;
                             }
                         }
                         Err(e) => warn!("Failed to discover new BTC market: {}", e),
@@ -218,10 +219,10 @@ async fn main() -> Result<()> {
         let trader = trader_clone.clone();
         
         async move {
-            let opportunities = detector.detect_opportunities(&snapshot);
+            let opportunities = detector.detect_opportunities(&snapshot).await;
             
             for opportunity in opportunities {
-                if let Err(e) = trader.execute_arbitrage(&opportunity).await {
+                if let Err(e) = trader.execute_arbitrage(&opportunity, snapshot.period_timestamp).await {
                     warn!("Error executing trade: {}", e);
                 }
             }

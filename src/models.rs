@@ -153,6 +153,8 @@ pub struct PendingTrade {
     pub investment_amount: f64,
     pub units: f64,
     pub timestamp: std::time::Instant,
+    pub market_timestamp: u64, // The 15-minute period timestamp when this trade was made (market closes at market_timestamp + 900 seconds)
+    pub losing_token_sold: Option<String>, // Track which token ID was sold (if any)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

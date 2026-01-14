@@ -2,27 +2,78 @@ use crate::models::*;
 use crate::monitor::MarketSnapshot;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use log::{debug, warn};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct ArbitrageDetector {
     min_profit_threshold: Decimal,
     min_time_remaining_to_trade_seconds: u64,
+    danger_signal_time_threshold_seconds: u64,
+    danger_signal_min_token_price: Decimal,
+    // Track if danger signal was triggered for the current period
+    // (period_timestamp, danger_triggered)
+    danger_signal_state: Arc<Mutex<(u64, bool)>>,
 }
 
 impl ArbitrageDetector {
-    pub fn new(min_profit_threshold: f64, min_time_remaining_to_trade_seconds: u64) -> Self {
+    pub fn new(
+        min_profit_threshold: f64,
+        min_time_remaining_to_trade_seconds: u64,
+        danger_signal_time_threshold_seconds: u64,
+        danger_signal_min_token_price: f64,
+    ) -> Self {
         Self {
             min_profit_threshold: Decimal::from_f64_retain(min_profit_threshold)
                 .unwrap_or(dec!(0.01)),
             min_time_remaining_to_trade_seconds,
+            danger_signal_time_threshold_seconds,
+            danger_signal_min_token_price: Decimal::from_f64_retain(danger_signal_min_token_price)
+                .unwrap_or(dec!(0.45)),
+            danger_signal_state: Arc::new(Mutex::new((0, false))),
+        }
+    }
+
+    /// Reset danger signal flag when a new period starts
+    pub async fn reset_period(&self, new_period_timestamp: u64) {
+        let mut state = self.danger_signal_state.lock().await;
+        *state = (new_period_timestamp, false);
+    }
+
+    /// Check if danger signal was already triggered for this period
+    async fn is_danger_signal_triggered(&self, current_period_timestamp: u64) -> bool {
+        let state = self.danger_signal_state.lock().await;
+        state.0 == current_period_timestamp && state.1
+    }
+
+    /// Mark danger signal as triggered for the current period
+    async fn trigger_danger_signal(&self, current_period_timestamp: u64) {
+        let mut state = self.danger_signal_state.lock().await;
+        if state.0 != current_period_timestamp {
+            // New period, reset
+            *state = (current_period_timestamp, true);
+        } else {
+            // Same period, just mark as triggered
+            state.1 = true;
         }
     }
 
     /// Detect arbitrage opportunities between ETH and BTC markets
     /// Strategy: Buy Up token in ETH market + Buy Down token in BTC market
     /// when total cost < $1
-    pub fn detect_opportunities(&self, snapshot: &MarketSnapshot) -> Vec<ArbitrageOpportunity> {
+    pub async fn detect_opportunities(&self, snapshot: &MarketSnapshot) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
+
+        // Check if danger signal was already triggered for this period
+        // If yes, block all trading for the rest of this period
+        if self.is_danger_signal_triggered(snapshot.period_timestamp).await {
+            warn!(
+                "🚨 DANGER SIGNAL was triggered earlier for this period ({}). Blocking all trades for the rest of this period.",
+                snapshot.period_timestamp
+            );
+            return opportunities;
+        }
 
         // Filter 1: Only trade when configured time or less remain
         // Default: 600 seconds (10 minutes) - means bot waits 5 minutes before trading
@@ -45,7 +96,9 @@ impl ArbitrageDetector {
                 &snapshot.eth_market.condition_id,
                 &snapshot.btc_market.condition_id,
                 crate::models::ArbitrageStrategy::EthUpBtcDown,
-            ) {
+                snapshot.time_remaining_seconds,
+                snapshot.period_timestamp,
+            ).await {
                 opportunities.push(opportunity);
             }
         }
@@ -58,7 +111,9 @@ impl ArbitrageDetector {
                 &snapshot.eth_market.condition_id,
                 &snapshot.btc_market.condition_id,
                 crate::models::ArbitrageStrategy::EthDownBtcUp,
-            ) {
+                snapshot.time_remaining_seconds,
+                snapshot.period_timestamp,
+            ).await {
                 opportunities.push(opportunity);
             }
         }
@@ -66,13 +121,15 @@ impl ArbitrageDetector {
         opportunities
     }
 
-    fn check_arbitrage(
+    async fn check_arbitrage(
         &self,
         token1: &TokenPrice,
         token2: &TokenPrice,
         condition1: &str,
         condition2: &str,
         strategy: crate::models::ArbitrageStrategy,
+        time_remaining_seconds: u64,
+        period_timestamp: u64,
     ) -> Option<ArbitrageOpportunity> {
         let price1 = token1.ask_price();
         let price2 = token2.ask_price();
@@ -80,6 +137,26 @@ impl ArbitrageDetector {
         let dollar = dec!(1.0);
         let min_price_threshold = dec!(0.6);
         let min_higher_token_price = dec!(0.65);
+
+        // DANGER SIGNAL: If time remaining < danger_signal_time_threshold_seconds
+        // AND both tokens are below danger_signal_min_token_price, reject trade
+        // AND mark this period as having a danger signal (blocks all future trades this period)
+        if time_remaining_seconds < self.danger_signal_time_threshold_seconds {
+            if price1 <= self.danger_signal_min_token_price && price2 <= self.danger_signal_min_token_price {
+                // Strong reject - dangerous signal detected
+                // Mark this period as having a danger signal
+                self.trigger_danger_signal(period_timestamp).await;
+                warn!(
+                    "🚨 DANGER SIGNAL TRIGGERED: Time remaining {}s < {}s AND both tokens below ${:.2} (Token1: ${:.2}, Token2: ${:.2}) - REJECTING TRADE AND BLOCKING ALL FUTURE TRADES FOR THIS PERIOD",
+                    time_remaining_seconds,
+                    self.danger_signal_time_threshold_seconds,
+                    self.danger_signal_min_token_price,
+                    price1,
+                    price2
+                );
+                return None;
+            }
+        }
 
         // Safety filter: Don't trade if both tokens are below $0.6 (rug case)
         // This avoids cases where both markets might go against us

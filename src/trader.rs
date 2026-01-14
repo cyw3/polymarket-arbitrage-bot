@@ -48,8 +48,11 @@ impl Trader {
         let mut pending = self.pending_trades.lock().await;
         let mut to_remove = Vec::new();
         
-        // Only check trades that are at least 14 minutes old (markets close after 15 minutes)
-        let min_age = Duration::from_secs(14 * 60);
+        // Get current timestamp to check if markets have closed
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         
         let pending_count = pending.len();
         if pending_count > 0 {
@@ -57,17 +60,21 @@ impl Trader {
         }
         
         for (key, trade) in pending.iter() {
-            let age = trade.timestamp.elapsed();
+            // Market closes at market_timestamp + 900 seconds (15 minutes)
+            // Check if market has closed based on the actual market period end time, not trade execution time
+            let market_end_timestamp = trade.market_timestamp + 900;
             
-            // Skip checking if trade is too recent (markets won't be closed yet)
-            if age < min_age {
-                debug!("Trade {} is too recent (age: {:.1}s, need: {:.1}s), skipping", 
-                       key, age.as_secs_f64(), min_age.as_secs_f64());
+            // Only check if we're past the market closing time (with 30 second buffer for API delays)
+            if current_timestamp < market_end_timestamp - 30 {
+                let time_until_close = market_end_timestamp - current_timestamp;
+                debug!("Trade {} market hasn't closed yet (closes in {}s, at timestamp {}), skipping", 
+                       key, time_until_close, market_end_timestamp);
                 continue;
             }
             
-            info!("🔍 Checking market closure for trade {} (age: {:.1} minutes)", 
-                  key, age.as_secs_f64() / 60.0);
+            let time_since_close = current_timestamp.saturating_sub(market_end_timestamp);
+            info!("🔍 Checking market closure for trade {} (market closed {}s ago, period: {})", 
+                  key, time_since_close, trade.market_timestamp);
             
             // Check if markets are closed (using cached data when possible)
             let (eth_closed, eth_winner) = self.check_market_result_cached(&trade.eth_condition_id, &trade.eth_token_id).await?;
@@ -392,7 +399,7 @@ impl Trader {
     }
 
     /// Execute arbitrage trade (with smart filtering to avoid too many trades)
-    pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
+    pub async fn execute_arbitrage(&self, opportunity: &ArbitrageOpportunity, market_timestamp: u64) -> Result<()> {
         // Check if we should execute this trade based on cooldown and profit improvement
         if !self.should_execute_trade(opportunity).await {
             debug!("⏸️  Skipping trade - cooldown active or insufficient profit improvement");
@@ -400,9 +407,9 @@ impl Trader {
         }
         
         if self.simulation_mode {
-            self.simulate_trade(opportunity).await
+            self.simulate_trade(opportunity, market_timestamp).await
         } else {
-            self.execute_real_trade(opportunity).await
+            self.execute_real_trade(opportunity, market_timestamp).await
         }
     }
     
@@ -463,7 +470,7 @@ impl Trader {
         true
     }
 
-    async fn simulate_trade(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
+    async fn simulate_trade(&self, opportunity: &ArbitrageOpportunity, market_timestamp: u64) -> Result<()> {
         info!(
             "🔍 SIMULATION: Arbitrage opportunity detected!"
         );
@@ -541,6 +548,8 @@ impl Trader {
                 investment_amount: position_size,
                 units,
                 timestamp: std::time::Instant::now(),
+                market_timestamp,
+                losing_token_sold: None,
             };
             pending.insert(trade_key, pending_trade);
         }
@@ -568,7 +577,7 @@ impl Trader {
         Ok(())
     }
 
-    async fn execute_real_trade(&self, opportunity: &ArbitrageOpportunity) -> Result<()> {
+    async fn execute_real_trade(&self, opportunity: &ArbitrageOpportunity, market_timestamp: u64) -> Result<()> {
         info!("🚀 PRODUCTION: Executing real arbitrage trade...");
         
         let position_size = self.calculate_position_size(opportunity);
@@ -626,79 +635,99 @@ impl Trader {
         info!("   Token quantities (rounded to 2 decimals): ETH: {:.2}, BTC: {:.2}", 
               eth_quantity_rounded, btc_quantity_rounded);
 
-        // Use MARKET orders (FOK) for immediate execution
+        // Use BATCH MARKET orders (FOK) for atomic execution
         // FOK (Fill-or-Kill): Order must fill completely or be cancelled
-        // This ensures immediate execution at current market price, which is critical for arbitrage
-        // where prices can change quickly and we need both orders to execute simultaneously
-        info!("   🚀 Using MARKET orders (FOK) for immediate execution at current market price");
+        // Batch orders ensure that either BOTH orders execute together or NEITHER executes
+        // This is critical for arbitrage where both tokens must be purchased simultaneously
+        info!("   🚀 Using BATCH MARKET orders (FOK) for atomic execution at current market price");
+        info!("   ⚠️  Both orders will execute together or both will fail (atomic execution)");
         
-        // Execute both orders as market orders (FOK)
-        let (eth_result, btc_result) = tokio::join!(
-            self.api.place_market_order(
-                &opportunity.eth_token_id,
-                eth_quantity_rounded,
-                "BUY",
-                Some("FOK"), // Fill-or-Kill: must fill completely or be cancelled
-            ),
-            self.api.place_market_order(
-                &opportunity.btc_token_id,
-                btc_quantity_rounded,
-                "BUY",
-                Some("FOK"), // Fill-or-Kill: must fill completely or be cancelled
-            )
-        );
+        // Execute both orders as a batch (atomic execution)
+        let batch_orders = vec![
+            (opportunity.eth_token_id.as_str(), eth_quantity_rounded, "BUY", Some("FOK")),
+            (opportunity.btc_token_id.as_str(), btc_quantity_rounded, "BUY", Some("FOK")),
+        ];
+        
+        let batch_results = self.api.place_batch_market_orders(batch_orders).await;
+        
+        // Check if batch execution succeeded
+        let (eth_result, btc_result): (Result<OrderResponse, anyhow::Error>, Result<OrderResponse, anyhow::Error>) = match &batch_results {
+            Ok(results) if results.len() == 2 => {
+                (Ok(results[0].clone()), Ok(results[1].clone()))
+            }
+            Ok(results) => {
+                anyhow::bail!("Batch order returned {} results, expected 2", results.len());
+            }
+            Err(e) => {
+                // Batch failed - both orders failed together (atomic execution)
+                anyhow::bail!("Batch order execution failed (both orders rejected): {}", e);
+            }
+        };
 
         // Check if both orders succeeded before logging
-        let eth_success = eth_result.is_ok();
-        let btc_success = btc_result.is_ok();
+        let eth_success = eth_result.is_ok() && eth_result.as_ref().unwrap().message.as_ref().map(|m| m.contains("successfully")).unwrap_or(false);
+        let btc_success = btc_result.is_ok() && btc_result.as_ref().unwrap().message.as_ref().map(|m| m.contains("successfully")).unwrap_or(false);
         
         // Log with correct labels based on strategy
+        // Note: With batch orders, both orders succeed or both fail together (atomic execution)
         match opportunity.strategy {
             ArbitrageStrategy::EthUpBtcDown => {
                 match &eth_result {
                     Ok(response) => {
-                        info!("✅ ETH Up order EXECUTED (FOK market order): {:?}", response);
+                        info!("✅ ETH Up order EXECUTED (batch FOK market order)");
                         if let Some(order_id) = &response.order_id {
                             info!("   Order ID: {}", order_id);
                         }
+                        if let Some(msg) = &response.message {
+                            info!("   {}", msg);
+                        }
                     }
                     Err(e) => {
-                        warn!("❌ Failed to execute ETH Up order: {}", e);
+                        warn!("❌ Failed to execute ETH Up order (batch failed): {}", e);
                     }
                 }
                 match &btc_result {
                     Ok(response) => {
-                        info!("✅ BTC Down order EXECUTED (FOK market order): {:?}", response);
+                        info!("✅ BTC Down order EXECUTED (batch FOK market order)");
                         if let Some(order_id) = &response.order_id {
                             info!("   Order ID: {}", order_id);
                         }
+                        if let Some(msg) = &response.message {
+                            info!("   {}", msg);
+                        }
                     }
                     Err(e) => {
-                        warn!("❌ Failed to execute BTC Down order: {}", e);
+                        warn!("❌ Failed to execute BTC Down order (batch failed): {}", e);
                     }
                 }
             }
             ArbitrageStrategy::EthDownBtcUp => {
                 match &eth_result {
                     Ok(response) => {
-                        info!("✅ ETH Down order EXECUTED (FOK market order): {:?}", response);
+                        info!("✅ ETH Down order EXECUTED (batch FOK market order)");
                         if let Some(order_id) = &response.order_id {
                             info!("   Order ID: {}", order_id);
                         }
+                        if let Some(msg) = &response.message {
+                            info!("   {}", msg);
+                        }
                     }
                     Err(e) => {
-                        warn!("❌ Failed to execute ETH Down order: {}", e);
+                        warn!("❌ Failed to execute ETH Down order (batch failed): {}", e);
                     }
                 }
                 match &btc_result {
                     Ok(response) => {
-                        info!("✅ BTC Up order EXECUTED (FOK market order): {:?}", response);
+                        info!("✅ BTC Up order EXECUTED (batch FOK market order)");
                         if let Some(order_id) = &response.order_id {
                             info!("   Order ID: {}", order_id);
                         }
+                        if let Some(msg) = &response.message {
+                            info!("   {}", msg);
+                        }
                     }
                     Err(e) => {
-                        warn!("❌ Failed to execute BTC Up order: {}", e);
+                        warn!("❌ Failed to execute BTC Up order (batch failed): {}", e);
                     }
                 }
             }
@@ -740,6 +769,8 @@ impl Trader {
                 investment_amount: position_size,
                 units,
                 timestamp: std::time::Instant::now(),
+                market_timestamp,
+                losing_token_sold: None,
             };
             pending.insert(trade_key, pending_trade);
         }
@@ -794,124 +825,6 @@ impl Trader {
         *self.last_trade_time.lock().await = None;
         *self.last_trade_profit_pct.lock().await = None;
         info!("🔄 Trade cooldown reset for new period");
-    }
-
-    /// Check clear condition sell: When 90s remain, sell losing token if outcome is clear
-    /// Example: ETH Up = $0.96, BTC Down = $0.1 → sell BTC Down (it's clearly losing)
-    pub async fn check_clear_condition_sell(&self, current_market_timestamp: u64) -> Result<()> {
-        let pending = self.pending_trades.lock().await;
-        let pending_count = pending.len();
-        drop(pending);
-        
-        if pending_count == 0 {
-            return Ok(());
-        }
-
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        // Calculate time remaining until market closes
-        let market_end_timestamp = current_market_timestamp + 900;
-        let time_remaining = if market_end_timestamp > current_time {
-            market_end_timestamp - current_time
-        } else {
-            0
-        };
-
-        // Only check when configured time threshold or less remain
-        if time_remaining > self.config.clear_condition_sell_time_threshold_seconds {
-            return Ok(());
-        }
-
-        // Check all pending trades
-        let trades_to_sell = {
-            let pending = self.pending_trades.lock().await;
-            let mut trades_to_sell = Vec::new();
-            
-            for (key, trade) in pending.iter() {
-                // Fetch current prices for both tokens
-                let eth_price_result = self.api.get_price(&trade.eth_token_id, "SELL").await;
-                let btc_price_result = self.api.get_price(&trade.btc_token_id, "SELL").await;
-                
-                let (eth_price, btc_price) = match (eth_price_result, btc_price_result) {
-                    (Ok(eth), Ok(btc)) => (eth, btc),
-                    _ => {
-                        debug!("⚠️  Could not fetch prices for clear condition check on trade {}", key);
-                        continue;
-                    }
-                };
-
-                let eth_price_f64 = f64::try_from(eth_price).unwrap_or(0.0);
-                let btc_price_f64 = f64::try_from(btc_price).unwrap_or(0.0);
-
-                // Clear condition: One token is very high (> $0.90) and the other is very low (< $0.20)
-                // This indicates the outcome is clear - sell the losing token
-                const HIGH_PRICE_THRESHOLD: f64 = 0.90;
-                const LOW_PRICE_THRESHOLD: f64 = 0.20;
-                
-                let eth_is_winning = eth_price_f64 > HIGH_PRICE_THRESHOLD;
-                let eth_is_losing = eth_price_f64 < LOW_PRICE_THRESHOLD;
-                let btc_is_winning = btc_price_f64 > HIGH_PRICE_THRESHOLD;
-                let btc_is_losing = btc_price_f64 < LOW_PRICE_THRESHOLD;
-
-                // If one token is clearly winning and the other is clearly losing, sell the losing one
-                if (eth_is_winning && btc_is_losing) || (btc_is_winning && eth_is_losing) {
-                    let losing_token_id = if eth_is_losing {
-                        trade.eth_token_id.clone()
-                    } else {
-                        trade.btc_token_id.clone()
-                    };
-                    let losing_token_price = if eth_is_losing { eth_price_f64 } else { btc_price_f64 };
-                    let winning_token_price = if eth_is_winning { eth_price_f64 } else { btc_price_f64 };
-                    
-                    info!("🎯 CLEAR CONDITION DETECTED for trade {}:", key);
-                    info!("   Time remaining: {} seconds (threshold: {} seconds)", 
-                          time_remaining, self.config.clear_condition_sell_time_threshold_seconds);
-                    info!("   ETH Token Price: ${:.2}", eth_price_f64);
-                    info!("   BTC Token Price: ${:.2}", btc_price_f64);
-                    info!("   Outcome is clear: {} token is winning (${:.2}), {} token is losing (${:.2})",
-                          if eth_is_winning { "ETH" } else { "BTC" },
-                          winning_token_price,
-                          if eth_is_losing { "ETH" } else { "BTC" },
-                          losing_token_price);
-                    
-                    trades_to_sell.push((key.clone(), trade.clone(), losing_token_id));
-                }
-            }
-            
-            trades_to_sell
-        };
-        
-        // Sell the losing tokens
-        for (key, trade, losing_token_id) in trades_to_sell {
-            info!("💸 Selling losing token {} from trade {}", losing_token_id, key);
-            
-            if !self.simulation_mode {
-                // In production, sell the losing token
-                match self.api.place_market_order(
-                    &losing_token_id,
-                    trade.units,
-                    "SELL",
-                    Some("FOK"),
-                ).await {
-                    Ok(response) => {
-                        info!("✅ Successfully sold losing token. Order ID: {:?}", response.order_id);
-                        // Note: We don't remove the trade from pending because we still have the winning token
-                        // The trade will be handled when the market closes
-                    }
-                    Err(e) => {
-                        warn!("⚠️  Failed to sell losing token: {}", e);
-                    }
-                }
-            } else {
-                // In simulation, just log
-                info!("   💰 SIMULATION: Would sell {} units of losing token", trade.units);
-            }
-        }
-        
-        Ok(())
     }
 
     /// Check emergency sell conditions for all pending trades

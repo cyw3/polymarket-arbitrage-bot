@@ -683,6 +683,166 @@ impl PolymarketApi {
         
         Ok(order_response)
     }
+
+    /// Place multiple market orders in a batch (atomic execution)
+    /// 
+    /// This ensures that either ALL orders are executed together or NONE are executed.
+    /// Critical for arbitrage where both tokens must be purchased simultaneously.
+    /// 
+    /// Parameters:
+    /// - orders: Vec of (token_id, amount, side, order_type) tuples
+    ///   - token_id: Token ID to trade (as &str)
+    ///   - amount: Quantity to trade
+    ///   - side: "BUY" or "SELL"
+    ///   - order_type: Optional "FOK" or "FAK", defaults to "FOK"
+    /// 
+    /// Returns: Vec of OrderResponse for each order
+    pub async fn place_batch_market_orders(
+        &self,
+        orders: Vec<(&str, f64, &str, Option<&str>)>,
+    ) -> Result<Vec<OrderResponse>> {
+        if orders.is_empty() {
+            anyhow::bail!("Cannot place batch orders: orders list is empty");
+        }
+
+        // Check if we have a private key (required for signing)
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
+        
+        // Create signer from private key
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
+        
+        // Build authentication builder with proxy wallet support
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer);
+        
+        // Configure proxy wallet if provided
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
+            
+            auth_builder = auth_builder.funder(funder_address);
+            
+            // Set signature type based on config or default to Proxy
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
+                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            // If signature type is set but no proxy wallet, validate it's EOA
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        
+        // Create CLOB client with authentication
+        let client = auth_builder
+            .authenticate()
+            .await
+            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        
+        use rust_decimal::{Decimal, RoundingStrategy};
+        use rust_decimal::prelude::*;
+        
+        info!("📤 Creating and signing {} orders for batch execution...", orders.len());
+        
+        // Create and sign all orders
+        let mut signed_orders = Vec::new();
+        for (idx, (token_id, amount, side, order_type)) in orders.iter().enumerate() {
+            // Convert order side string to SDK Side enum
+            let side_enum = match *side {
+                "BUY" => Side::Buy,
+                "SELL" => Side::Sell,
+                _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", side),
+            };
+            
+            // Convert amount to Decimal and round to 2 decimal places
+            let amount_decimal = Decimal::from_f64_retain(*amount)
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal for order {}", idx))?
+                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+            
+            info!("   Order {}: {} {} {} (type: {:?})", 
+                  idx + 1, side, amount_decimal, token_id, 
+                  order_type.unwrap_or("FOK"));
+            
+            // Fetch current market price for market orders
+            let market_price = if matches!(side_enum, Side::Buy) {
+                self.get_price(token_id, "BUY")
+                    .await
+                    .context(format!("Failed to fetch current market price for BUY order {} (token: {})", idx + 1, token_id))?
+            } else {
+                self.get_price(token_id, "SELL")
+                    .await
+                    .context(format!("Failed to fetch current market price for SELL order {} (token: {})", idx + 1, token_id))?
+            };
+            
+            // Create and sign the order
+            let order_builder = client
+                .limit_order()
+                .token_id((*token_id).to_string())
+                .size(amount_decimal)
+                .price(market_price)
+                .side(side_enum);
+            
+            let signed_order = client.sign(&signer, order_builder.build().await?)
+                .await
+                .context(format!("Failed to sign order {} (token: {})", idx + 1, token_id))?;
+            
+            signed_orders.push(signed_order);
+        }
+        
+        // Post all orders in a single batch request (atomic execution)
+        info!("🚀 Posting {} orders in batch (atomic execution)...", signed_orders.len());
+        
+        let responses = client.post_orders(signed_orders)
+            .await
+            .context("Failed to post batch orders. Either all orders will succeed or all will fail (atomic execution).")?;
+        
+        // Convert SDK responses to our OrderResponse format
+        let mut order_responses = Vec::new();
+        for (idx, response) in responses.iter().enumerate() {
+            let order_response = OrderResponse {
+                order_id: Some(response.order_id.clone()),
+                status: response.status.to_string(),
+                message: if response.success {
+                    Some(format!("Batch order {} executed successfully. Order ID: {}", idx + 1, response.order_id))
+                } else {
+                    response.error_msg.clone()
+                },
+            };
+            
+            if response.success {
+                info!("✅ Batch order {} executed successfully! Order ID: {}", idx + 1, response.order_id);
+            } else {
+                let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
+                warn!("⚠️  Batch order {} returned error: {}", idx + 1, error_msg);
+            }
+            
+            order_responses.push(order_response);
+        }
+        
+        // Check if all orders succeeded
+        let all_succeeded = order_responses.iter().all(|r| r.message.as_ref().map(|m| m.contains("successfully")).unwrap_or(false));
+        if all_succeeded {
+            info!("✅ All {} batch orders executed successfully!", order_responses.len());
+        } else {
+            let failed_count = order_responses.iter().filter(|r| !r.message.as_ref().map(|m| m.contains("successfully")).unwrap_or(false)).count();
+            warn!("⚠️  Batch order execution: {} succeeded, {} failed", 
+                  order_responses.len() - failed_count, failed_count);
+        }
+        
+        Ok(order_responses)
+    }
     
     /// Place an order using REST API with HMAC authentication (fallback method)
     /// 

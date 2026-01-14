@@ -25,6 +25,7 @@ pub struct MarketSnapshot {
     pub btc_market: MarketData,
     pub timestamp: std::time::Instant,
     pub time_remaining_seconds: u64, // Time remaining in the current 15-minute period
+    pub period_timestamp: u64, // The 15-minute period timestamp (e.g., 1767796200)
 }
 
 impl MarketMonitor {
@@ -275,6 +276,7 @@ impl MarketMonitor {
             btc_market: btc_market_data,
             timestamp: std::time::Instant::now(),
             time_remaining_seconds: eth_remaining_secs,
+            period_timestamp: eth_market_timestamp, // Use ETH market timestamp as period identifier
         })
     }
 
