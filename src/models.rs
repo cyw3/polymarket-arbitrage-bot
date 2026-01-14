@@ -126,35 +126,35 @@ pub struct MarketData {
 }
 
 #[derive(Debug, Clone)]
-pub enum ArbitrageStrategy {
-    EthUpBtcDown,  // Strategy 1: Buy ETH Up + BTC Down
-    EthDownBtcUp,  // Strategy 2: Buy ETH Down + BTC Up
+pub enum TrendStrategy {
+    BothUp,    // Both markets trending up (ETH Up + BTC Up)
+    BothDown,  // Both markets trending down (ETH Down + BTC Down)
 }
 
 #[derive(Debug, Clone)]
-pub struct ArbitrageOpportunity {
-    pub strategy: ArbitrageStrategy,
-    pub eth_token_price: Decimal,  // Price of ETH token (Up or Down depending on strategy)
-    pub btc_token_price: Decimal,  // Price of BTC token (Down or Up depending on strategy)
-    pub total_cost: Decimal,
-    pub expected_profit: Decimal,
-    pub eth_token_id: String,  // Token ID for ETH token (Up or Down)
-    pub btc_token_id: String,  // Token ID for BTC token (Down or Up)
+pub struct TrendOpportunity {
+    pub strategy: TrendStrategy,
+    pub eth_higher_token_price: Decimal,  // Price of ETH's higher token (Up or Down)
+    pub btc_higher_token_price: Decimal,  // Price of BTC's higher token (Up or Down)
+    pub eth_higher_token_id: String,      // Token ID for ETH's higher token
+    pub btc_higher_token_id: String,      // Token ID for BTC's higher token
     pub eth_condition_id: String,
     pub btc_condition_id: String,
+    pub selected_token_id: String,       // The token to buy (higher priced one)
+    pub selected_token_price: Decimal,    // Price of the selected token
+    pub selected_condition_id: String,    // Condition ID of the selected token's market
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingTrade {
-    pub eth_token_id: String,
-    pub btc_token_id: String,
-    pub eth_condition_id: String,
-    pub btc_condition_id: String,
-    pub investment_amount: f64,
-    pub units: f64,
-    pub timestamp: std::time::Instant,
-    pub market_timestamp: u64, // The 15-minute period timestamp when this trade was made (market closes at market_timestamp + 900 seconds)
-    pub losing_token_sold: Option<String>, // Track which token ID was sold (if any)
+    pub token_id: String,              // The token that was purchased
+    pub condition_id: String,          // Condition ID of the market
+    pub investment_amount: f64,        // Fixed trade amount (e.g., $1.00)
+    pub units: f64,                    // Number of shares purchased
+    pub purchase_price: f64,           // Price at which token was purchased
+    pub timestamp: std::time::Instant, // When the trade was executed
+    pub market_timestamp: u64,         // The 15-minute period timestamp when this trade was made (market closes at market_timestamp + 900 seconds)
+    pub sold: bool,                    // Whether this token has been sold
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

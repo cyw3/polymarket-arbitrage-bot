@@ -83,19 +83,6 @@ impl MarketMonitor {
         Ok(())
     }
 
-    /// Check if we need to discover new markets (new 15-minute period started)
-    pub async fn should_discover_new_markets(&self) -> bool {
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let current_period = (current_time / 900) * 900;
-        
-        let stored_period = *self.current_period_timestamp.lock().await;
-        
-        // If current period is different from stored period, we need new markets
-        current_period != stored_period
-    }
 
     /// Get current market condition IDs (for checking if markets are closed)
     pub async fn get_current_condition_ids(&self) -> (String, String) {

@@ -1,5 +1,5 @@
 mod api;
-mod arbitrage;
+mod trend;
 mod config;
 mod models;
 mod monitor;
@@ -10,22 +10,74 @@ use clap::Parser;
 use config::{Args, Config};
 use log::{info, warn};
 use std::sync::Arc;
+use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::sync::Mutex;
 
 use api::PolymarketApi;
-use arbitrage::ArbitrageDetector;
+use trend::TrendDetector;
 use monitor::MarketMonitor;
 use trader::Trader;
 
+/// A writer that writes to both stderr (terminal) and a file
+/// Wrapped in Arc<Mutex<>> for thread-safe access
+struct DualWriter {
+    stderr: io::Stderr,
+    file: Mutex<File>,
+}
+
+impl Write for DualWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Write to stderr (terminal) - stderr is already thread-safe
+        let _ = self.stderr.write_all(buf);
+        let _ = self.stderr.flush();
+        
+        // Write to file (protected by Mutex for thread safety)
+        let mut file = self.file.lock().unwrap();
+        file.write_all(buf)?;
+        file.flush()?;
+        
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stderr.flush()?;
+        let mut file = self.file.lock().unwrap();
+        file.flush()?;
+        Ok(())
+    }
+}
+
+// Make DualWriter Send + Sync for use with env_logger
+unsafe impl Send for DualWriter {}
+unsafe impl Sync for DualWriter {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Open log file in append mode
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("history.toml")
+        .context("Failed to open history.toml for logging")?;
+    
+    // Create dual writer
+    let dual_writer = DualWriter {
+        stderr: io::stderr(),
+        file: Mutex::new(log_file),
+    };
+    
+    // Initialize logger with dual writer
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .target(env_logger::Target::Pipe(Box::new(dual_writer)))
         .init();
 
     let args = Args::parse();
     let config = Config::load(&args.config)?;
 
-    info!("🚀 Starting Polymarket Arbitrage Bot");
+    info!("🚀 Starting Polymarket Trend Trading Bot");
+    info!("📝 Logs are being saved to: history.toml");
     let is_simulation = args.is_simulation();
     info!("Mode: {}", if is_simulation { "SIMULATION" } else { "PRODUCTION" });
 
@@ -84,11 +136,11 @@ async fn main() -> Result<()> {
     );
     let monitor_arc = Arc::new(monitor);
 
-    let detector = ArbitrageDetector::new(
+    let detector = TrendDetector::new(
+        config.trading.trend_detection_threshold,
+        config.trading.duration_analysis_seconds,
+        config.trading.min_passed_data_points,
         config.trading.min_profit_threshold,
-        config.trading.min_time_remaining_to_trade_seconds,
-        config.trading.danger_signal_time_threshold_seconds,
-        config.trading.danger_signal_min_token_price,
     );
     let trader = Trader::new(
         api.clone(),
@@ -100,8 +152,6 @@ async fn main() -> Result<()> {
     let detector_clone = detector.clone();
     let trader_arc = Arc::new(trader);
     let trader_clone = trader_arc.clone();
-    let monitor_for_trading = monitor_arc.clone();
-    let api_for_discovery = api.clone();
     
     // Start a background task to check pending trades periodically
     // Check every 30 seconds to catch market closures quickly (markets close after 15 minutes)
@@ -124,10 +174,12 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10)); // Check every 10 seconds
         loop {
             interval.tick().await;
-            let current_market_timestamp = monitor_emergency.get_current_market_timestamp().await;
             
-            // Check emergency sell conditions
-            if let Err(e) = trader_emergency.check_emergency_sell(current_market_timestamp).await {
+            // Get current condition IDs for both markets
+            let (eth_condition_id, btc_condition_id) = monitor_emergency.get_current_condition_ids().await;
+            
+            // Check emergency sell conditions (checks all tokens in both markets)
+            if let Err(e) = trader_emergency.check_emergency_sell(&eth_condition_id, &btc_condition_id).await {
                 warn!("Error checking emergency sell conditions: {}", e);
             }
         }
@@ -200,9 +252,9 @@ async fn main() -> Result<()> {
                             if let Err(e) = monitor_for_period_check.update_markets(eth_market, btc_market).await {
                                 warn!("Failed to update markets: {}", e);
                             } else {
-                                // Reset trade cooldown for new period
+                                // Reset period (no-op, but kept for consistency)
                                 trader_for_period_reset.reset_period().await;
-                                // Reset danger signal flag for new period
+                                // Reset trend detector for new period
                                 detector_for_period_reset.reset_period(current_period).await;
                             }
                         }
@@ -219,10 +271,8 @@ async fn main() -> Result<()> {
         let trader = trader_clone.clone();
         
         async move {
-            let opportunities = detector.detect_opportunities(&snapshot).await;
-            
-            for opportunity in opportunities {
-                if let Err(e) = trader.execute_arbitrage(&opportunity, snapshot.period_timestamp).await {
+            if let Some(opportunity) = detector.detect_opportunities(&snapshot).await {
+                if let Err(e) = trader.execute_trend_trade(&opportunity, snapshot.period_timestamp).await {
                     warn!("Error executing trade: {}", e);
                 }
             }
@@ -234,9 +284,8 @@ async fn main() -> Result<()> {
 
 async fn get_or_discover_markets(
     api: &PolymarketApi,
-    config: &Config,
+    _config: &Config,
 ) -> Result<(crate::models::Market, crate::models::Market)> {
-    use crate::models::Market;
     
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -268,7 +317,6 @@ async fn discover_market(
     current_time: u64,
     seen_ids: &mut std::collections::HashSet<String>,
 ) -> Result<crate::models::Market> {
-    use crate::models::Market;
     
     // Method 1: Try to get by slug with current timestamp (rounded to nearest 15min)
     // Pattern: btc-updown-15m-{timestamp} or eth-updown-15m-{timestamp}
