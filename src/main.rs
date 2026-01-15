@@ -166,24 +166,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start a background task to check emergency sell conditions periodically
-    // Check every 10 seconds to catch emergency conditions quickly
-    let trader_emergency = trader_clone.clone();
-    let monitor_emergency = monitor_arc.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10)); // Check every 10 seconds
-        loop {
-            interval.tick().await;
-            
-            // Get current condition IDs for both markets
-            let (eth_condition_id, btc_condition_id) = monitor_emergency.get_current_condition_ids().await;
-            
-            // Check emergency sell conditions (checks all tokens in both markets)
-            if let Err(e) = trader_emergency.check_emergency_sell(&eth_condition_id, &btc_condition_id).await {
-                warn!("Error checking emergency sell conditions: {}", e);
-            }
-        }
-    });
+    // Note: Emergency sell is now checked on every price update in the monitor callback
+    // This provides faster response time (every 1 second instead of every 10 seconds)
 
     // Start a background task to detect new 15-minute periods and discover new markets
     // Uses the current market's timestamp to calculate exactly when the next period starts
@@ -266,15 +250,29 @@ async fn main() -> Result<()> {
         }
     });
     
+    let monitor_for_emergency = monitor_arc.clone();
     monitor_arc.start_monitoring(move |snapshot| {
         let detector = detector_clone.clone();
         let trader = trader_clone.clone();
+        let monitor_for_emergency = monitor_for_emergency.clone();
         
         async move {
+            // Check for trend opportunities
             if let Some(opportunity) = detector.detect_opportunities(&snapshot).await {
                 if let Err(e) = trader.execute_trend_trade(&opportunity, snapshot.period_timestamp).await {
                     warn!("Error executing trade: {}", e);
                 }
+            }
+            
+            // Check emergency sell conditions on every price update (faster response)
+            let (eth_condition_id, btc_condition_id) = monitor_for_emergency.get_current_condition_ids().await;
+            if let Err(e) = trader.check_emergency_sell(&eth_condition_id, &btc_condition_id).await {
+                warn!("Error checking emergency sell conditions: {}", e);
+            }
+            
+            // Check opposite-side trades for profit/loss thresholds
+            if let Err(e) = trader.check_opposite_side_trades().await {
+                warn!("Error checking opposite-side trades: {}", e);
             }
         }
     }).await;

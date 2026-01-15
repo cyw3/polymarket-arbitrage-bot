@@ -21,6 +21,7 @@ pub struct Trader {
     total_profit: Arc<Mutex<f64>>,
     trades_executed: Arc<Mutex<u64>>,
     pending_trades: Arc<Mutex<HashMap<String, PendingTrade>>>, // Key: unique trade ID (token_id + timestamp_nanos)
+    opposite_side_trades: Arc<Mutex<HashMap<String, OppositeSideTrade>>>, // Key: unique trade ID
     market_cache: Arc<Mutex<HashMap<String, CachedMarketData>>>, // Key: condition_id, cache for 60 seconds
 }
 
@@ -33,6 +34,7 @@ impl Trader {
             total_profit: Arc::new(Mutex::new(0.0)),
             trades_executed: Arc::new(Mutex::new(0)),
             pending_trades: Arc::new(Mutex::new(HashMap::new())),
+            opposite_side_trades: Arc::new(Mutex::new(HashMap::new())),
             market_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -398,6 +400,8 @@ impl Trader {
             timestamp: trade_timestamp,
             market_timestamp,
             sold: false,
+            eth_trend_token_id: opportunity.eth_higher_token_id.clone(),
+            btc_trend_token_id: opportunity.btc_higher_token_id.clone(),
         };
         pending.insert(trade_key, pending_trade);
         drop(pending);
@@ -501,6 +505,8 @@ impl Trader {
             timestamp: trade_timestamp,
             market_timestamp,
             sold: false,
+            eth_trend_token_id: opportunity.eth_higher_token_id.clone(),
+            btc_trend_token_id: opportunity.btc_higher_token_id.clone(),
         };
         pending.insert(trade_key, pending_trade);
         drop(pending);
@@ -553,138 +559,66 @@ impl Trader {
             return Ok(());
         }
 
-        // Fetch prices for all tokens and determine which are the higher (trend) tokens
-        // Also store market data for later use in token name lookup
-        let (eth_higher_price, eth_higher_name, btc_higher_price, btc_higher_name, eth_market, btc_market) = {
-            // Get market data for ETH
+        // Get market data for token name lookup
+        let (eth_market, btc_market) = {
             let eth_market = self.api.get_market(eth_condition_id).await?;
-            let eth_up_token = eth_market.tokens.iter().find(|t| {
-                let outcome = t.outcome.to_uppercase();
-                outcome.contains("UP") || outcome == "1"
-            });
-            let eth_down_token = eth_market.tokens.iter().find(|t| {
-                let outcome = t.outcome.to_uppercase();
-                outcome.contains("DOWN") || outcome == "0"
-            });
-
-            // Get market data for BTC
             let btc_market = self.api.get_market(btc_condition_id).await?;
-            let btc_up_token = btc_market.tokens.iter().find(|t| {
-                let outcome = t.outcome.to_uppercase();
-                outcome.contains("UP") || outcome == "1"
-            });
-            let btc_down_token = btc_market.tokens.iter().find(|t| {
-                let outcome = t.outcome.to_uppercase();
-                outcome.contains("DOWN") || outcome == "0"
-            });
-
-            // Fetch prices for all 4 tokens
-            let (eth_up_price, eth_down_price, btc_up_price, btc_down_price) = tokio::join!(
-                async {
-                    if let Some(token) = eth_up_token {
-                        self.api.get_price(&token.token_id, "SELL").await.ok()
-                            .and_then(|p| f64::try_from(p).ok())
-                    } else {
-                        None
-                    }
-                },
-                async {
-                    if let Some(token) = eth_down_token {
-                        self.api.get_price(&token.token_id, "SELL").await.ok()
-                            .and_then(|p| f64::try_from(p).ok())
-                    } else {
-                        None
-                    }
-                },
-                async {
-                    if let Some(token) = btc_up_token {
-                        self.api.get_price(&token.token_id, "SELL").await.ok()
-                            .and_then(|p| f64::try_from(p).ok())
-                    } else {
-                        None
-                    }
-                },
-                async {
-                    if let Some(token) = btc_down_token {
-                        self.api.get_price(&token.token_id, "SELL").await.ok()
-                            .and_then(|p| f64::try_from(p).ok())
-                    } else {
-                        None
-                    }
-                },
-            );
-
-            // Determine which token is higher in each market (the trend token)
-            let (eth_higher_price, eth_higher_name) = match (eth_up_price, eth_down_price) {
-                (Some(up), Some(down)) => {
-                    if up > down {
-                        (up, "ETH Up")
-                    } else {
-                        (down, "ETH Down")
-                    }
-                }
-                (Some(up), None) => (up, "ETH Up"),
-                (None, Some(down)) => (down, "ETH Down"),
-                (None, None) => return Ok(()), // Can't determine, skip
-            };
-
-            let (btc_higher_price, btc_higher_name) = match (btc_up_price, btc_down_price) {
-                (Some(up), Some(down)) => {
-                    if up > down {
-                        (up, "BTC Up")
-                    } else {
-                        (down, "BTC Down")
-                    }
-                }
-                (Some(up), None) => (up, "BTC Up"),
-                (None, Some(down)) => (down, "BTC Down"),
-                (None, None) => return Ok(()), // Can't determine, skip
-            };
-
-            (eth_higher_price, eth_higher_name, btc_higher_price, btc_higher_name, eth_market, btc_market)
+            (eth_market, btc_market)
         };
 
-        // Check if EITHER trending token (higher token from either market) dropped below threshold
-        // If so, sell ALL pending trades because the trend is breaking
-        let eth_trend_below_threshold = eth_higher_price < self.config.emergency_sell_threshold;
-        let btc_trend_below_threshold = btc_higher_price < self.config.emergency_sell_threshold;
+        // Check each trade's ORIGINAL trending tokens (not current higher tokens)
+        // If EITHER original trending token dropped below threshold, sell ALL trades
+        let mut should_sell_all = false;
+        let mut triggered_tokens = Vec::new();
         
-        if !eth_trend_below_threshold && !btc_trend_below_threshold {
-            // Both trending tokens are still above threshold - no emergency sell needed
+        // Check prices of original trending tokens for all trades
+        // We need to check if ANY trade's original trending tokens dropped below threshold
+        for (_, trade) in &pending_trades {
+            // Fetch prices of the ORIGINAL trending tokens from when this trade was made
+            let (eth_trend_price_result, btc_trend_price_result) = tokio::join!(
+                self.api.get_price(&trade.eth_trend_token_id, "SELL"),
+                self.api.get_price(&trade.btc_trend_token_id, "SELL"),
+            );
+            
+            let eth_trend_price = eth_trend_price_result.ok()
+                .and_then(|p| f64::try_from(p).ok());
+            let btc_trend_price = btc_trend_price_result.ok()
+                .and_then(|p| f64::try_from(p).ok());
+            
+            if let Some(eth_price) = eth_trend_price {
+                if eth_price < self.config.emergency_sell_threshold {
+                    should_sell_all = true;
+                    triggered_tokens.push(format!("ETH trending token (${:.2})", eth_price));
+                }
+            }
+            
+            if let Some(btc_price) = btc_trend_price {
+                if btc_price < self.config.emergency_sell_threshold {
+                    should_sell_all = true;
+                    triggered_tokens.push(format!("BTC trending token (${:.2})", btc_price));
+                }
+            }
+        }
+        
+        if !should_sell_all {
+            // All original trending tokens are still above threshold - no emergency sell needed
             return Ok(());
         }
         
-        // One or both trending tokens dropped below threshold - sell ALL pending trades
-        let mut trades_to_sell = Vec::new();
-        
-        // Determine which token triggered the sell
-        let triggered_token = if eth_trend_below_threshold && btc_trend_below_threshold {
-            format!("Both {} and {}", eth_higher_name, btc_higher_name)
-        } else if eth_trend_below_threshold {
-            eth_higher_name.to_string()
-        } else {
-            btc_higher_name.to_string()
-        };
-        
-        info!("🚨 EMERGENCY SELL TRIGGERED: {} price(s) below threshold ${:.2}", 
-              triggered_token, self.config.emergency_sell_threshold);
-        info!("   Current trending token prices:");
-        info!("     {}: ${:.2}", eth_higher_name, eth_higher_price);
-        info!("     {}: ${:.2}", btc_higher_name, btc_higher_price);
+        // One or more original trending tokens dropped below threshold - sell ALL pending trades
+        info!("🚨 EMERGENCY SELL TRIGGERED: Original trending token(s) below threshold ${:.2}", 
+              self.config.emergency_sell_threshold);
+        for token_info in &triggered_tokens {
+            info!("   {} dropped below threshold", token_info);
+        }
         info!("   Selling ALL {} pending trade(s)...", pending_trades.len());
         
         // Collect all pending trades to sell
+        let mut trades_to_sell = Vec::new();
         for (key, trade) in pending_trades {
             // Determine which market this trade belongs to
             let is_eth_market = trade.condition_id == eth_condition_id;
             let is_btc_market = trade.condition_id == btc_condition_id;
-            
-            if !is_eth_market && !is_btc_market {
-                // Trade belongs to a different market (maybe from previous period)
-                // Still sell it if we have it
-                debug!("⚠️  Trade {} belongs to unknown market (condition_id: {}), but will sell due to trend break", 
-                       &key[..16], &trade.condition_id[..16]);
-            }
             
             // Determine token name for logging
             let market_name = if is_eth_market { "ETH" } else if is_btc_market { "BTC" } else { "Unknown" };
@@ -723,10 +657,261 @@ impl Trader {
             return Ok(());
         }
         
-        // Now sell all affected trades
-        for (key, trade) in trades_to_sell {
-            if let Err(e) = self.emergency_sell_trade(&key, &trade).await {
+        // Now sell all affected trades and buy opposite tokens
+        let mut opposite_tokens_to_buy = Vec::new();
+        
+        for (key, trade) in &trades_to_sell {
+            if let Err(e) = self.emergency_sell_trade(key, trade).await {
                 warn!("Error executing emergency sell for trade {}: {}", key, e);
+            }
+            
+            // Determine which original trending token triggered the sell
+            // If ETH trending token dropped, buy ETH opposite token
+            // If BTC trending token dropped, buy BTC opposite token
+            let eth_trend_price_result = self.api.get_price(&trade.eth_trend_token_id, "SELL").await.ok()
+                .and_then(|p| f64::try_from(p).ok());
+            let btc_trend_price_result = self.api.get_price(&trade.btc_trend_token_id, "SELL").await.ok()
+                .and_then(|p| f64::try_from(p).ok());
+            
+            let eth_triggered = eth_trend_price_result.map(|p| p < self.config.emergency_sell_threshold).unwrap_or(false);
+            let btc_triggered = btc_trend_price_result.map(|p| p < self.config.emergency_sell_threshold).unwrap_or(false);
+            
+            // Buy opposite token for the market that triggered the sell
+            if self.config.enable_opposite_side_buy {
+                if eth_triggered && trade.condition_id == eth_condition_id {
+                    // ETH trending token dropped - buy ETH opposite token
+                    if let Ok(opposite_token_id) = self.get_opposite_token_id(&trade.condition_id, &trade.token_id).await {
+                        opposite_tokens_to_buy.push((opposite_token_id, trade.condition_id.clone(), trade.eth_trend_token_id.clone()));
+                    }
+                } else if btc_triggered && trade.condition_id == btc_condition_id {
+                    // BTC trending token dropped - buy BTC opposite token
+                    if let Ok(opposite_token_id) = self.get_opposite_token_id(&trade.condition_id, &trade.token_id).await {
+                        opposite_tokens_to_buy.push((opposite_token_id, trade.condition_id.clone(), trade.btc_trend_token_id.clone()));
+                    }
+                } else if eth_triggered {
+                    // ETH trending token dropped but this is a BTC trade - still buy ETH opposite
+                    if let Ok(opposite_token_id) = self.get_opposite_token_id(eth_condition_id, &trade.eth_trend_token_id).await {
+                        opposite_tokens_to_buy.push((opposite_token_id, eth_condition_id.to_string(), trade.eth_trend_token_id.clone()));
+                    }
+                } else if btc_triggered {
+                    // BTC trending token dropped but this is an ETH trade - still buy BTC opposite
+                    if let Ok(opposite_token_id) = self.get_opposite_token_id(btc_condition_id, &trade.btc_trend_token_id).await {
+                        opposite_tokens_to_buy.push((opposite_token_id, btc_condition_id.to_string(), trade.btc_trend_token_id.clone()));
+                    }
+                }
+            }
+        }
+        
+        // Buy opposite tokens (avoid duplicates)
+        let mut seen_opposite = std::collections::HashSet::new();
+        for (opposite_token_id, condition_id, original_trend_token_id) in opposite_tokens_to_buy {
+            let key = format!("{}:{}", condition_id, opposite_token_id);
+            if !seen_opposite.contains(&key) {
+                seen_opposite.insert(key.clone());
+                if let Err(e) = self.buy_opposite_token(&opposite_token_id, &condition_id, &original_trend_token_id).await {
+                    warn!("Error buying opposite token {}: {}", &opposite_token_id[..16], e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the opposite token ID for a given token in a market
+    async fn get_opposite_token_id(&self, condition_id: &str, token_id: &str) -> Result<String> {
+        let market = self.api.get_market(condition_id).await?;
+        
+        // Find the token that's opposite to the given token
+        for token in &market.tokens {
+            if token.token_id != token_id {
+                // Check if this is the opposite token
+                let outcome_upper = token.outcome.to_uppercase();
+                let given_token = market.tokens.iter().find(|t| t.token_id == token_id);
+                
+                if let Some(given) = given_token {
+                    let given_outcome_upper = given.outcome.to_uppercase();
+                    // If given token is Up, return Down token, and vice versa
+                    if (given_outcome_upper.contains("UP") || given_outcome_upper == "1") &&
+                       (outcome_upper.contains("DOWN") || outcome_upper == "0") {
+                        return Ok(token.token_id.clone());
+                    } else if (given_outcome_upper.contains("DOWN") || given_outcome_upper == "0") &&
+                              (outcome_upper.contains("UP") || outcome_upper == "1") {
+                        return Ok(token.token_id.clone());
+                    }
+                }
+            }
+        }
+        
+        anyhow::bail!("Could not find opposite token for token {} in market {}", &token_id[..16], &condition_id[..16])
+    }
+    
+    /// Buy opposite-side token when emergency sell triggers
+    async fn buy_opposite_token(&self, opposite_token_id: &str, condition_id: &str, original_trend_token_id: &str) -> Result<()> {
+        info!("🔄 Buying opposite-side token {} (original trend token: {})", 
+              &opposite_token_id[..16], &original_trend_token_id[..16]);
+        
+        let fixed_amount = self.config.fixed_trade_amount;
+        
+        // Get current price
+        let price_result = self.api.get_price(opposite_token_id, "BUY").await;
+        let price = match price_result {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("⚠️  Could not fetch price for opposite token: {}", e);
+                return Err(e);
+            }
+        };
+        
+        let price_f64 = f64::try_from(price).unwrap_or(0.0);
+        let units = fixed_amount / price_f64;
+        
+        // Get current market timestamp
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let market_timestamp = (current_timestamp / 900) * 900;
+        
+        if self.simulation_mode {
+            info!("   💰 SIMULATION: Buying {:.2} units of opposite token at ${:.4}", units, price_f64);
+            info!("   📊 Investment: ${:.2} | Expected value if wins: ${:.2}", fixed_amount, units);
+        } else {
+            // Place real market order
+            let units_rounded = (units * 10000.0).round() / 10000.0; // Round to 4 decimal places
+            
+            info!("   💰 PRODUCTION: Placing market order for {:.4} units at ${:.4}", units_rounded, price_f64);
+            
+            match self.api.place_market_order(opposite_token_id, units_rounded, "BUY", Some("FOK")).await {
+                Ok(response) => {
+                    info!("   ✅ Order placed: {:?}", response);
+                }
+                Err(e) => {
+                    warn!("   ⚠️  Failed to place order: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        
+        // Track the opposite-side trade
+        let trade_timestamp = std::time::Instant::now();
+        let system_time_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let trade_key = format!("{}:{}", opposite_token_id, system_time_nanos);
+        
+        let opposite_trade = OppositeSideTrade {
+            token_id: opposite_token_id.to_string(),
+            condition_id: condition_id.to_string(),
+            investment_amount: fixed_amount,
+            units: if self.simulation_mode { units } else { units },
+            purchase_price: price_f64,
+            timestamp: trade_timestamp,
+            market_timestamp,
+            sold: false,
+            original_trend_token_id: original_trend_token_id.to_string(),
+        };
+        
+        let mut opposite_trades = self.opposite_side_trades.lock().await;
+        opposite_trades.insert(trade_key.clone(), opposite_trade);
+        drop(opposite_trades);
+        
+        info!("   ✅ Opposite-side trade tracked: {}", &trade_key[..16]);
+        
+        Ok(())
+    }
+    
+    /// Check opposite-side trades and sell if profit/loss thresholds are met
+    pub async fn check_opposite_side_trades(&self) -> Result<()> {
+        let opposite_trades: Vec<(String, OppositeSideTrade)> = {
+            let trades = self.opposite_side_trades.lock().await;
+            trades.iter()
+                .filter(|(_, trade)| !trade.sold)
+                .map(|(key, trade)| (key.clone(), trade.clone()))
+                .collect()
+        };
+        
+        if opposite_trades.is_empty() {
+            return Ok(());
+        }
+        
+        for (key, trade) in opposite_trades {
+            // Get current price
+            let price_result = self.api.get_price(&trade.token_id, "SELL").await;
+            let current_price = match price_result {
+                Ok(p) => f64::try_from(p).unwrap_or(0.0),
+                Err(_) => continue, // Skip if can't get price
+            };
+            
+            // Calculate profit/loss percentage
+            let price_change = current_price - trade.purchase_price;
+            let price_change_pct = price_change / trade.purchase_price;
+            
+            // Check if profit threshold met (+50%)
+            let profit_threshold = self.config.opposite_token_profit_threshold;
+            let loss_threshold = -self.config.opposite_token_loss_threshold;
+            
+            let should_sell = if price_change_pct >= profit_threshold {
+                info!("📈 Opposite token {} profit threshold met: {:.2}% (threshold: {:.2}%)", 
+                      &trade.token_id[..16], price_change_pct * 100.0, profit_threshold * 100.0);
+                true
+            } else if price_change_pct <= loss_threshold {
+                info!("📉 Opposite token {} loss threshold met: {:.2}% (threshold: {:.2}%)", 
+                      &trade.token_id[..16], price_change_pct * 100.0, loss_threshold * 100.0);
+                true
+            } else {
+                false
+            };
+            
+            if should_sell {
+                if let Err(e) = self.sell_opposite_token(&key, &trade, current_price).await {
+                    warn!("Error selling opposite token {}: {}", key, e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Sell an opposite-side token
+    async fn sell_opposite_token(&self, trade_key: &str, trade: &OppositeSideTrade, current_price: f64) -> Result<()> {
+        info!("💸 Selling opposite-side token {} at ${:.4}...", &trade.token_id[..16], current_price);
+        
+        if self.simulation_mode {
+            let sell_value = current_price * trade.units;
+            let profit = sell_value - trade.investment_amount;
+            
+            let mut total = self.total_profit.lock().await;
+            *total += profit;
+            let total_profit = *total;
+            drop(total);
+            
+            // Mark as sold
+            let mut opposite_trades = self.opposite_side_trades.lock().await;
+            if let Some(t) = opposite_trades.get_mut(trade_key) {
+                t.sold = true;
+            }
+            drop(opposite_trades);
+            
+            info!("   💰 Sold {:.2} units at ${:.4}", trade.units, current_price);
+            info!("   📊 Profit: ${:.4} | Total Profit: ${:.2}", profit, total_profit);
+        } else {
+            // Place market sell order
+            match self.api.place_market_order(&trade.token_id, trade.units, "SELL", Some("FOK")).await {
+                Ok(response) => {
+                    info!("   ✅ Sell order placed: {:?}", response);
+                    
+                    // Mark as sold
+                    let mut opposite_trades = self.opposite_side_trades.lock().await;
+                    if let Some(t) = opposite_trades.get_mut(trade_key) {
+                        t.sold = true;
+                    }
+                    drop(opposite_trades);
+                }
+                Err(e) => {
+                    warn!("   ⚠️  Failed to place sell order: {}", e);
+                    return Err(e);
+                }
             }
         }
         

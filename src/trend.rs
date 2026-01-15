@@ -94,9 +94,9 @@ impl TrendDetector {
             TrendStrategy::BothDown
         };
 
-        // Step 2: Check if both higher tokens are >= trend_detection_threshold ($0.7)
-        let both_above_threshold = eth_higher_price >= self.trend_detection_threshold && 
-                                   btc_higher_price >= self.trend_detection_threshold;
+        // Step 2: Check if both higher tokens are > trend_detection_threshold ($0.7)
+        let both_above_threshold = eth_higher_price > self.trend_detection_threshold && 
+                                   btc_higher_price > self.trend_detection_threshold;
 
         let mut state = self.analysis_state.lock().await;
         
@@ -163,8 +163,8 @@ impl TrendDetector {
         // Count how many points passed (both tokens >= threshold)
         let passed_points = points_to_analyze.iter()
             .filter(|point| {
-                point.eth_higher_price >= self.trend_detection_threshold &&
-                point.btc_higher_price >= self.trend_detection_threshold
+                point.eth_higher_price > self.trend_detection_threshold &&
+                point.btc_higher_price > self.trend_detection_threshold
             })
             .count();
 

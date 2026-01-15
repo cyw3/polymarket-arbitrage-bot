@@ -93,6 +93,15 @@ pub struct TradingConfig {
     /// Interval for checking market closure after period ends
     /// Default: 20 (20 seconds)
     pub market_closure_check_interval_seconds: u64,
+    /// Enable opposite-side token buy when emergency sell triggers
+    /// Default: true
+    pub enable_opposite_side_buy: bool,
+    /// Profit threshold for opposite-side token (sell when price increases by this percentage)
+    /// Default: 0.5 (50% profit)
+    pub opposite_token_profit_threshold: f64,
+    /// Loss threshold for opposite-side token (sell when price decreases by this percentage)
+    /// Default: 0.1 (10% loss)
+    pub opposite_token_loss_threshold: f64,
 }
 
 impl Default for Config {
@@ -120,6 +129,9 @@ impl Default for Config {
                 emergency_sell_threshold: 0.55, // $0.55
                 sell_retry_check_seconds: 5, // 5 seconds
                 market_closure_check_interval_seconds: 20, // 20 seconds
+                enable_opposite_side_buy: true, // Enable opposite-side buy
+                opposite_token_profit_threshold: 0.5, // 50% profit
+                opposite_token_loss_threshold: 0.1, // 10% loss
             },
         }
     }

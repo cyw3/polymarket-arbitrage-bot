@@ -155,6 +155,23 @@ pub struct PendingTrade {
     pub timestamp: std::time::Instant, // When the trade was executed
     pub market_timestamp: u64,         // The 15-minute period timestamp when this trade was made (market closes at market_timestamp + 900 seconds)
     pub sold: bool,                    // Whether this token has been sold
+    // Original trending tokens when trade was made (for emergency sell logic)
+    pub eth_trend_token_id: String,    // Token ID of ETH's trending token (Up or Down) at trade time
+    pub btc_trend_token_id: String,    // Token ID of BTC's trending token (Up or Down) at trade time
+}
+
+/// Opposite-side token trade (bought when emergency sell triggers)
+#[derive(Debug, Clone)]
+pub struct OppositeSideTrade {
+    pub token_id: String,              // The opposite token that was purchased
+    pub condition_id: String,          // Condition ID of the market
+    pub investment_amount: f64,        // Fixed trade amount (e.g., $1.00)
+    pub units: f64,                    // Number of shares purchased
+    pub purchase_price: f64,           // Price at which token was purchased
+    pub timestamp: std::time::Instant, // When the trade was executed
+    pub market_timestamp: u64,         // The 15-minute period timestamp when this trade was made
+    pub sold: bool,                    // Whether this token has been sold
+    pub original_trend_token_id: String, // The original trending token that triggered the emergency sell
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
