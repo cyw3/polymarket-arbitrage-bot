@@ -65,43 +65,18 @@ pub struct TradingConfig {
     pub eth_condition_id: Option<String>,
     pub btc_condition_id: Option<String>,
     pub check_interval_ms: u64,
-    /// Minimum profit threshold for both tokens to allow trading
-    /// Both tokens must have profit >= this value
-    /// Default: 0.04 (4%)
-    pub min_profit_threshold: f64,
     /// Fixed trade amount in USD for each purchase
     /// Default: 1.0 ($1.00)
     pub fixed_trade_amount: f64,
-    /// Threshold for higher token price to trigger trend detection
-    /// Both markets' higher tokens must be >= this price
-    /// Default: 0.7 ($0.70)
-    pub trend_detection_threshold: f64,
-    /// Duration analysis period in seconds
-    /// Bot analyzes data points for this duration after trend detection
-    /// Default: 60 (1 minute)
-    pub duration_analysis_seconds: u64,
-    /// Minimum number of passed data points (out of total) to allow trading
-    /// Total points = duration_analysis_seconds (assuming 1 point per second)
-    /// Default: 40 (out of 60 points)
-    pub min_passed_data_points: u64,
-    /// Emergency sell threshold - sell token if price drops below this
-    /// Default: 0.55 ($0.55)
-    pub emergency_sell_threshold: f64,
-    /// Time to wait after posting sell order before checking if still holding
-    /// Default: 5 (5 seconds)
-    pub sell_retry_check_seconds: u64,
+    /// Trigger price for ETH higher token ASK price (must hit this to trigger buy)
+    /// Default: 0.99 ($0.99 ASK price - what we receive when selling)
+    pub trigger_price: f64,
+    /// Minimum time remaining in seconds (must be > this to buy)
+    /// Default: 90 (90 seconds)
+    pub min_time_remaining_seconds: u64,
     /// Interval for checking market closure after period ends
     /// Default: 20 (20 seconds)
     pub market_closure_check_interval_seconds: u64,
-    /// Enable opposite-side token buy when emergency sell triggers
-    /// Default: true
-    pub enable_opposite_side_buy: bool,
-    /// Profit threshold for opposite-side token (sell when price increases by this percentage)
-    /// Default: 0.5 (50% profit)
-    pub opposite_token_profit_threshold: f64,
-    /// Loss threshold for opposite-side token (sell when price decreases by this percentage)
-    /// Default: 0.1 (10% loss)
-    pub opposite_token_loss_threshold: f64,
 }
 
 impl Default for Config {
@@ -121,17 +96,10 @@ impl Default for Config {
                 eth_condition_id: None,
                 btc_condition_id: None,
                 check_interval_ms: 1000,
-                min_profit_threshold: 0.04, // 4%
                 fixed_trade_amount: 1.0, // $1.00
-                trend_detection_threshold: 0.7, // $0.70
-                duration_analysis_seconds: 60, // 1 minute
-                min_passed_data_points: 40, // 40 out of 60 points
-                emergency_sell_threshold: 0.55, // $0.55
-                sell_retry_check_seconds: 5, // 5 seconds
+                trigger_price: 0.99, // $0.99 ASK price
+                min_time_remaining_seconds: 90, // 90 seconds
                 market_closure_check_interval_seconds: 20, // 20 seconds
-                enable_opposite_side_buy: true, // Enable opposite-side buy
-                opposite_token_profit_threshold: 0.5, // 50% profit
-                opposite_token_loss_threshold: 0.1, // 10% loss
             },
         }
     }

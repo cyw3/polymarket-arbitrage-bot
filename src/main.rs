@@ -1,5 +1,5 @@
 mod api;
-mod trend;
+mod detector;
 mod config;
 mod models;
 mod monitor;
@@ -12,10 +12,10 @@ use log::{info, warn};
 use std::sync::Arc;
 use std::io::{self, Write};
 use std::fs::{File, OpenOptions};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use api::PolymarketApi;
-use trend::TrendDetector;
+use detector::PriceDetector;
 use monitor::MarketMonitor;
 use trader::Trader;
 
@@ -52,6 +52,40 @@ impl Write for DualWriter {
 unsafe impl Send for DualWriter {}
 unsafe impl Sync for DualWriter {}
 
+/// Global file writer for eprintln! messages to be saved to history.toml
+static HISTORY_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+
+/// Initialize the global history file writer
+fn init_history_file(file: File) {
+    HISTORY_FILE.set(Mutex::new(file)).expect("History file already initialized");
+}
+
+/// Write a message to both stderr and history.toml (without timestamp/level prefix)
+pub fn log_to_history(message: &str) {
+    // Write to stderr
+    eprint!("{}", message);
+    let _ = io::stderr().flush();
+    
+    // Write to history file
+    if let Some(file_mutex) = HISTORY_FILE.get() {
+        if let Ok(mut file) = file_mutex.lock() {
+            let _ = write!(file, "{}", message);
+            let _ = file.flush();
+        }
+    }
+}
+
+/// Macro to log to both stderr and history.toml (like eprintln! but also saves to file)
+#[macro_export]
+macro_rules! log_println {
+    ($($arg:tt)*) => {
+        {
+            let message = format!($($arg)*);
+            $crate::log_to_history(&format!("{}\n", message));
+        }
+    };
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Open log file in append mode
@@ -60,6 +94,9 @@ async fn main() -> Result<()> {
         .append(true)
         .open("history.toml")
         .context("Failed to open history.toml for logging")?;
+    
+    // Initialize global history file for eprintln! messages
+    init_history_file(log_file.try_clone().context("Failed to clone history file")?);
     
     // Create dual writer
     let dual_writer = DualWriter {
@@ -76,10 +113,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
 
-    info!("🚀 Starting Polymarket Trend Trading Bot");
-    info!("📝 Logs are being saved to: history.toml");
+    eprintln!("🚀 Starting Polymarket Trend Trading Bot");
+    eprintln!("📝 Logs are being saved to: history.toml");
     let is_simulation = args.is_simulation();
-    info!("Mode: {}", if is_simulation { "SIMULATION" } else { "PRODUCTION" });
+    eprintln!("Mode: {}", if is_simulation { "SIMULATION" } else { "PRODUCTION" });
 
     // Initialize API client
     let api = Arc::new(PolymarketApi::new(
@@ -97,17 +134,17 @@ async fn main() -> Result<()> {
     // This verifies credentials and creates an authenticated client
     // Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds)
     if !is_simulation {
-        info!("");
-        info!("═══════════════════════════════════════════════════════════");
-        info!("🔐 Authenticating with Polymarket CLOB API...");
-        info!("═══════════════════════════════════════════════════════════");
+        eprintln!("");
+        eprintln!("═══════════════════════════════════════════════════════════");
+        eprintln!("🔐 Authenticating with Polymarket CLOB API...");
+        eprintln!("═══════════════════════════════════════════════════════════");
         
         match api.authenticate().await {
             Ok(_) => {
-                info!("✅ Authentication successful!");
-                info!("   Using private key and API credentials for signing");
-                info!("═══════════════════════════════════════════════════════════");
-                info!("");
+                eprintln!("✅ Authentication successful!");
+                eprintln!("   Using private key and API credentials for signing");
+                eprintln!("═══════════════════════════════════════════════════════════");
+                eprintln!("");
             }
             Err(e) => {
                 warn!("⚠️  Failed to authenticate: {}", e);
@@ -115,12 +152,12 @@ async fn main() -> Result<()> {
                 warn!("⚠️  Please verify your credentials:");
                 warn!("     1. private_key (hex string)");
                 warn!("     2. api_key, api_secret, api_passphrase");
-                info!("");
+                eprintln!("");
             }
         }
     } else {
-        info!("💡 Simulation mode: Skipping authentication");
-        info!("");
+        eprintln!("💡 Simulation mode: Skipping authentication");
+        eprintln!("");
     }
 
     // Get market data for ETH and BTC markets
@@ -136,11 +173,9 @@ async fn main() -> Result<()> {
     );
     let monitor_arc = Arc::new(monitor);
 
-    let detector = TrendDetector::new(
-        config.trading.trend_detection_threshold,
-        config.trading.duration_analysis_seconds,
-        config.trading.min_passed_data_points,
-        config.trading.min_profit_threshold,
+    let detector = PriceDetector::new(
+        config.trading.trigger_price,
+        config.trading.min_time_remaining_seconds,
     );
     let trader = Trader::new(
         api.clone(),
@@ -149,15 +184,15 @@ async fn main() -> Result<()> {
     );
 
     // Start monitoring
-    let detector_clone = detector.clone();
+    let detector_arc = Arc::new(detector);
+    let detector_clone = detector_arc.clone();
     let trader_arc = Arc::new(trader);
     let trader_clone = trader_arc.clone();
     
-    // Start a background task to check pending trades periodically
-    // Check every 30 seconds to catch market closures quickly (markets close after 15 minutes)
+    // Start a background task to check pending trades and sell points
     let trader_check = trader_clone.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30)); // Check every 30 seconds
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500)); // Check every 500ms for fast reaction
         loop {
             interval.tick().await;
             if let Err(e) = trader_check.check_pending_trades().await {
@@ -166,24 +201,30 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Note: Emergency sell is now checked on every price update in the monitor callback
-    // This provides faster response time (every 1 second instead of every 10 seconds)
+    // Start a background task to check market closure
+    let trader_closure = trader_clone.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            config.trading.market_closure_check_interval_seconds
+        ));
+        loop {
+            interval.tick().await;
+            if let Err(e) = trader_closure.check_market_closure().await {
+                warn!("Error checking market closure: {}", e);
+            }
+        }
+    });
 
     // Start a background task to detect new 15-minute periods and discover new markets
-    // Uses the current market's timestamp to calculate exactly when the next period starts
     let monitor_for_period_check = monitor_arc.clone();
     let api_for_period_check = api.clone();
     let trader_for_period_reset = trader_clone.clone();
-    let detector_for_period_reset = detector.clone();
+    let detector_for_period_reset = detector_arc.clone();
     tokio::spawn(async move {
         loop {
-            // Get current market's timestamp from slug (e.g., "eth-updown-15m-1767796200" -> 1767796200)
             let current_market_timestamp = monitor_for_period_check.get_current_market_timestamp().await;
-            
-            // Calculate when the next period starts: current_market_timestamp + 15 minutes (900 seconds)
             let next_period_timestamp = current_market_timestamp + 900;
             
-            // Calculate how long to sleep until the next period
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -192,54 +233,37 @@ async fn main() -> Result<()> {
             let sleep_duration = if next_period_timestamp > current_time {
                 next_period_timestamp - current_time
             } else {
-                // If we're already past the next period (shouldn't happen, but safety check)
                 0
             };
             
-            info!("⏰ Current market period: {}, next period starts in {} seconds (at {})", 
-                current_market_timestamp, sleep_duration, next_period_timestamp);
+            eprintln!("⏰ Current market period: {}, next period starts in {} seconds", 
+                current_market_timestamp, sleep_duration);
             
-            // Sleep until the next period starts
             tokio::time::sleep(tokio::time::Duration::from_secs(sleep_duration)).await;
             
-            // Now discover new markets for the new period
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
             let current_period = (current_time / 900) * 900;
             
-            info!("🔄 New 15-minute period detected! (Period: {}) Discovering new markets...", current_period);
+            eprintln!("🔄 New 15-minute period detected! (Period: {}) Discovering new markets...", current_period);
             
             let mut seen_ids = std::collections::HashSet::new();
-            // Get current condition IDs to avoid duplicates
             let (eth_id, btc_id) = monitor_for_period_check.get_current_condition_ids().await;
             seen_ids.insert(eth_id);
             seen_ids.insert(btc_id);
             
-            // Get previous period's condition IDs BEFORE updating to new markets
-            let (previous_eth_id, previous_btc_id) = monitor_for_period_check.get_current_condition_ids().await;
-            
-            // Discover new markets for current period
             match discover_market(&api_for_period_check, "ETH", "eth", current_time, &mut seen_ids).await {
                 Ok(eth_market) => {
                     seen_ids.insert(eth_market.condition_id.clone());
                     match discover_market(&api_for_period_check, "BTC", "btc", current_time, &mut seen_ids).await {
                         Ok(btc_market) => {
-                            // Check previous period's markets BEFORE updating to new markets
-                            info!("🔍 Checking if previous period's markets are closed...");
-                            if let Err(e) = trader_for_period_reset.check_previous_period_markets(&previous_eth_id, &previous_btc_id).await {
-                                warn!("Error checking previous period markets: {}", e);
-                            }
-                            
-                            // Now update to new markets
                             if let Err(e) = monitor_for_period_check.update_markets(eth_market, btc_market).await {
                                 warn!("Failed to update markets: {}", e);
                             } else {
-                                // Reset period (no-op, but kept for consistency)
-                                trader_for_period_reset.reset_period().await;
-                                // Reset trend detector for new period
-                                detector_for_period_reset.reset_period(current_period).await;
+                                trader_for_period_reset.reset_period(current_market_timestamp).await;
+                                detector_for_period_reset.reset_period().await;
                             }
                         }
                         Err(e) => warn!("Failed to discover new BTC market: {}", e),
@@ -250,29 +274,20 @@ async fn main() -> Result<()> {
         }
     });
     
-    let monitor_for_emergency = monitor_arc.clone();
+    // Start monitoring with new detector
     monitor_arc.start_monitoring(move |snapshot| {
         let detector = detector_clone.clone();
         let trader = trader_clone.clone();
-        let monitor_for_emergency = monitor_for_emergency.clone();
         
         async move {
-            // Check for trend opportunities
-            if let Some(opportunity) = detector.detect_opportunities(&snapshot).await {
-                if let Err(e) = trader.execute_trend_trade(&opportunity, snapshot.period_timestamp).await {
-                    warn!("Error executing trade: {}", e);
+            // Check for $0.98 trigger opportunity
+            if let Some(opportunity) = detector.detect_opportunity(&snapshot).await {
+                if let Err(e) = trader.execute_buy(&opportunity).await {
+                    warn!("Error executing buy: {}", e);
+                } else {
+                    // Mark that we bought in this period
+                    detector.mark_period_bought(opportunity.period_timestamp).await;
                 }
-            }
-            
-            // Check emergency sell conditions on every price update (faster response)
-            let (eth_condition_id, btc_condition_id) = monitor_for_emergency.get_current_condition_ids().await;
-            if let Err(e) = trader.check_emergency_sell(&eth_condition_id, &btc_condition_id).await {
-                warn!("Error checking emergency sell conditions: {}", e);
-            }
-            
-            // Check opposite-side trades for profit/loss thresholds
-            if let Err(e) = trader.check_opposite_side_trades().await {
-                warn!("Error checking opposite-side trades: {}", e);
             }
         }
     }).await;
@@ -324,7 +339,7 @@ async fn discover_market(
     if let Ok(market) = api.get_market_by_slug(&slug).await {
 
         if !seen_ids.contains(&market.condition_id) && market.active && !market.closed {
-            log::info!("Found {} market by slug: {} | Condition ID: {}", market_name, market.slug, market.condition_id);
+            eprintln!("Found {} market by slug: {} | Condition ID: {}", market_name, market.slug, market.condition_id);
             return Ok(market);
         }
     }
@@ -333,10 +348,10 @@ async fn discover_market(
     for offset in 1..=3 {
         let try_time = rounded_time - (offset * 900); // Try previous 15-minute intervals
         let try_slug = format!("{}-updown-15m-{}", slug_prefix, try_time);
-        log::info!("Trying previous {} market by slug: {}", market_name, try_slug);
+        eprintln!("Trying previous {} market by slug: {}", market_name, try_slug);
         if let Ok(market) = api.get_market_by_slug(&try_slug).await {
             if !seen_ids.contains(&market.condition_id) && market.active && !market.closed {
-                log::info!("Found {} market by slug: {} | Condition ID: {}", market_name, market.slug, market.condition_id);
+                eprintln!("Found {} market by slug: {} | Condition ID: {}", market_name, market.slug, market.condition_id);
                 return Ok(market);
             }
         }

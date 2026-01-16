@@ -58,9 +58,9 @@ impl MarketMonitor {
 
     /// Update markets when a new 15-minute period starts
     pub async fn update_markets(&self, eth_market: crate::models::Market, btc_market: crate::models::Market) -> Result<()> {
-        info!("🔄 Updating to new 15-minute period markets...");
-        info!("New ETH Market: {} ({})", eth_market.slug, eth_market.condition_id);
-        info!("New BTC Market: {} ({})", btc_market.slug, btc_market.condition_id);
+        eprintln!("🔄 Updating to new 15-minute period markets...");
+        eprintln!("New ETH Market: {} ({})", eth_market.slug, eth_market.condition_id);
+        eprintln!("New BTC Market: {} ({})", btc_market.slug, btc_market.condition_id);
         
         *self.eth_market.lock().await = eth_market;
         *self.btc_market.lock().await = btc_market;
@@ -120,10 +120,10 @@ impl MarketMonitor {
                 let outcome_upper = token.outcome.to_uppercase();
                 if outcome_upper.contains("UP") || outcome_upper == "1" {
                     *self.eth_up_token_id.lock().await = Some(token.token_id.clone());
-                    info!("ETH Up token_id: {}", token.token_id);
+                    eprintln!("ETH Up token_id: {}", token.token_id);
                 } else if outcome_upper.contains("DOWN") || outcome_upper == "0" {
                     *self.eth_down_token_id.lock().await = Some(token.token_id.clone());
-                    info!("ETH Down token_id: {}", token.token_id);
+                    eprintln!("ETH Down token_id: {}", token.token_id);
                 }
             }
         }
@@ -134,10 +134,10 @@ impl MarketMonitor {
                 let outcome_upper = token.outcome.to_uppercase();
                 if outcome_upper.contains("UP") || outcome_upper == "1" {
                     *self.btc_up_token_id.lock().await = Some(token.token_id.clone());
-                    info!("BTC Up token_id: {}", token.token_id);
+                    eprintln!("BTC Up token_id: {}", token.token_id);
                 } else if outcome_upper.contains("DOWN") || outcome_upper == "0" {
                     *self.btc_down_token_id.lock().await = Some(token.token_id.clone());
-                    info!("BTC Down token_id: {}", token.token_id);
+                    eprintln!("BTC Down token_id: {}", token.token_id);
                 }
             }
         }
@@ -219,29 +219,45 @@ impl MarketMonitor {
         let eth_remaining_str = format_remaining_time(eth_remaining_secs);
         let btc_remaining_str = format_remaining_time(btc_remaining_secs);
 
-        // Log prices in the requested format
+        // Helper function to format price with both BID and ASK
+        // BID = BUY price (what we pay when buying, higher)
+        // ASK = SELL price (what we receive when selling, lower)
+        let format_price_with_both = |p: &TokenPrice| -> String {
+            let bid = p.bid.unwrap_or(rust_decimal::Decimal::ZERO);
+            let ask = p.ask.unwrap_or(rust_decimal::Decimal::ZERO);
+            let bid_f64: f64 = bid.to_string().parse().unwrap_or(0.0);
+            let ask_f64: f64 = ask.to_string().parse().unwrap_or(0.0);
+            format!("BID:${:.2} ASK:${:.2}", bid_f64, ask_f64)
+        };
+
+        // Log prices with both ASK and BID
         let eth_up_str = eth_up_price.as_ref()
-            .map(|p| format!("${:.2}", p.ask_price()))
+            .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
         let eth_down_str = eth_down_price.as_ref()
-            .map(|p| format!("${:.2}", p.ask_price()))
+            .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
         let btc_up_str = btc_up_price.as_ref()
-            .map(|p| format!("${:.2}", p.ask_price()))
+            .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
         let btc_down_str = btc_down_price.as_ref()
-            .map(|p| format!("${:.2}", p.ask_price()))
+            .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
 
-        info!(
-            "ETH Up Token Price: {} Down Token Price: {} remaining time:{} market_timestamp:{}",
+        // Print directly to stderr and history.toml without log formatting for cleaner output
+        let message = format!(
+            "ETH Up Token {} Down Token {} remaining time:{} market_timestamp:{}\n",
             eth_up_str, eth_down_str, eth_remaining_str, eth_market_timestamp
         );
-        info!(
-            "BTC Up Token Price: {} Down Token Price: {} remaining time:{} market_timestamp:{}",
+        crate::log_to_history(&message);
+        
+        let message = format!(
+            "BTC Up Token {} Down Token {} remaining time:{} market_timestamp:{}\n",
             btc_up_str, btc_down_str, btc_remaining_str, btc_market_timestamp
         );
-        info!(""); // Empty line for readability
+        crate::log_to_history(&message);
+        
+        crate::log_to_history("\n"); // Empty line for readability
 
         let eth_market_data = MarketData {
             condition_id: eth_condition_id,
@@ -275,7 +291,8 @@ impl MarketMonitor {
     ) -> Option<TokenPrice> {
         let token_id = token_id.as_ref()?;
 
-        // Get BUY price (ask price - what we pay to buy)
+        // Get BUY price (BID price - what we pay to buy, higher)
+        // get_price(token_id, "BUY") returns the BID price (what we pay to buy)
         let buy_price = match self.api.get_price(token_id, "BUY").await {
             Ok(price) => Some(price),
             Err(e) => {
@@ -284,7 +301,8 @@ impl MarketMonitor {
             }
         };
 
-        // Get SELL price (bid price - what we get when selling)
+        // Get SELL price (ASK price - what we receive when selling, lower)
+        // get_price(token_id, "SELL") returns the ASK price (what we receive when selling)
         let sell_price = match self.api.get_price(token_id, "SELL").await {
             Ok(price) => Some(price),
             Err(e) => {
@@ -296,8 +314,8 @@ impl MarketMonitor {
         if buy_price.is_some() || sell_price.is_some() {
             Some(TokenPrice {
                 token_id: token_id.clone(),
-                bid: sell_price,
-                ask: buy_price,
+                bid: buy_price,  // BID = BUY price (what we pay to buy, higher)
+                ask: sell_price, // ASK = SELL price (what we receive when selling, lower)
             })
         } else {
             None
@@ -324,7 +342,7 @@ impl MarketMonitor {
         F: Fn(MarketSnapshot) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        info!("Starting market monitoring...");
+        eprintln!("Starting market monitoring...");
         
         loop {
             match self.fetch_market_data().await {

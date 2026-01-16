@@ -125,53 +125,21 @@ pub struct MarketData {
     pub down_token: Option<TokenPrice>,
 }
 
-#[derive(Debug, Clone)]
-pub enum TrendStrategy {
-    BothUp,    // Both markets trending up (ETH Up + BTC Up)
-    BothDown,  // Both markets trending down (ETH Down + BTC Down)
-}
-
-#[derive(Debug, Clone)]
-pub struct TrendOpportunity {
-    pub strategy: TrendStrategy,
-    pub eth_higher_token_price: Decimal,  // Price of ETH's higher token (Up or Down)
-    pub btc_higher_token_price: Decimal,  // Price of BTC's higher token (Up or Down)
-    pub eth_higher_token_id: String,      // Token ID for ETH's higher token
-    pub btc_higher_token_id: String,      // Token ID for BTC's higher token
-    pub eth_condition_id: String,
-    pub btc_condition_id: String,
-    pub selected_token_id: String,       // The token to buy (higher priced one)
-    pub selected_token_price: Decimal,    // Price of the selected token
-    pub selected_condition_id: String,    // Condition ID of the selected token's market
-}
-
+/// Trade for D-based strategy (buy ETH Down when ETH higher token hits $0.98)
 #[derive(Debug, Clone)]
 pub struct PendingTrade {
-    pub token_id: String,              // The token that was purchased
-    pub condition_id: String,          // Condition ID of the market
-    pub investment_amount: f64,        // Fixed trade amount (e.g., $1.00)
-    pub units: f64,                    // Number of shares purchased
-    pub purchase_price: f64,           // Price at which token was purchased
+    pub token_id: String,              // ETH Down token ID
+    pub condition_id: String,          // ETH condition ID
+    pub investment_amount: f64,        // Fixed trade amount
+    pub total_units: f64,              // Total shares purchased
+    pub remaining_units: f64,          // Remaining shares to sell
+    pub purchase_price: f64,           // Price at which token was purchased (~$0.01)
+    pub difference_d: f64,             // D value when trade was made
     pub timestamp: std::time::Instant, // When the trade was executed
-    pub market_timestamp: u64,         // The 15-minute period timestamp when this trade was made (market closes at market_timestamp + 900 seconds)
-    pub sold: bool,                    // Whether this token has been sold
-    // Original trending tokens when trade was made (for emergency sell logic)
-    pub eth_trend_token_id: String,    // Token ID of ETH's trending token (Up or Down) at trade time
-    pub btc_trend_token_id: String,    // Token ID of BTC's trending token (Up or Down) at trade time
-}
-
-/// Opposite-side token trade (bought when emergency sell triggers)
-#[derive(Debug, Clone)]
-pub struct OppositeSideTrade {
-    pub token_id: String,              // The opposite token that was purchased
-    pub condition_id: String,          // Condition ID of the market
-    pub investment_amount: f64,        // Fixed trade amount (e.g., $1.00)
-    pub units: f64,                    // Number of shares purchased
-    pub purchase_price: f64,           // Price at which token was purchased
-    pub timestamp: std::time::Instant, // When the trade was executed
-    pub market_timestamp: u64,         // The 15-minute period timestamp when this trade was made
-    pub sold: bool,                    // Whether this token has been sold
-    pub original_trend_token_id: String, // The original trending token that triggered the emergency sell
+    pub market_timestamp: u64,         // The 15-minute period timestamp
+    pub sell_points: Vec<f64>,         // Price points to sell at (e.g., [0.02, 0.04, 0.08])
+    pub sell_percentages: Vec<f64>,    // Percentage to sell at each point (e.g., [0.5, 0.5, 1.0])
+    pub next_sell_index: usize,        // Index of next sell point
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

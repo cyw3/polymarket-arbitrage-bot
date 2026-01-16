@@ -109,7 +109,7 @@ impl PolymarketApi {
             };
             
             auth_builder = auth_builder.signature_type(sig_type);
-            info!("🔐 Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
+            eprintln!("🔐 Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
         } else if let Some(sig_type_num) = self.signature_type {
             // If signature type is set but no proxy wallet, validate it's EOA
             let sig_type = match sig_type_num {
@@ -130,13 +130,13 @@ impl PolymarketApi {
         // Mark as authenticated
         *self.authenticated.lock().await = true;
         
-        info!("✅ Successfully authenticated with Polymarket CLOB API");
-        info!("   ✓ Private key: Valid");
-        info!("   ✓ API credentials: Valid");
+        eprintln!("✅ Successfully authenticated with Polymarket CLOB API");
+        eprintln!("   ✓ Private key: Valid");
+        eprintln!("   ✓ API credentials: Valid");
         if let Some(proxy_addr) = &self.proxy_wallet_address {
-            info!("   ✓ Proxy wallet: {}", proxy_addr);
+            eprintln!("   ✓ Proxy wallet: {}", proxy_addr);
         } else {
-            info!("   ✓ Trading account: EOA (private key account)");
+            eprintln!("   ✓ Trading account: EOA (private key account)");
         }
         Ok(())
     }
@@ -468,7 +468,7 @@ impl PolymarketApi {
         let size = rust_decimal::Decimal::from_str(&order.size)
             .context(format!("Failed to parse size: {}", order.size))?;
         
-        info!("📤 Creating and posting order: {} {} {} @ {}", 
+        eprintln!("📤 Creating and posting order: {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
         
         // Create and post order using SDK (equivalent to: client.createAndPostOrder(userOrder))
@@ -533,7 +533,7 @@ impl PolymarketApi {
             message: Some(format!("Order placed successfully. Order ID: {}", response.order_id)),
         };
         
-        info!("✅ Order placed successfully! Order ID: {}", response.order_id);
+        eprintln!("✅ Order placed successfully! Order ID: {}", response.order_id);
         
         Ok(order_response)
     }
@@ -621,7 +621,7 @@ impl PolymarketApi {
             .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?
             .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
         
-        info!("📤 Creating and posting MARKET order: {} {} {} (type: {:?})", 
+        eprintln!("📤 Creating and posting MARKET order: {} {} {} (type: {:?})", 
               side, amount_decimal, token_id, order_type_enum);
         
         // For market orders, we need to use the current market price to respect tick size requirements
@@ -640,7 +640,7 @@ impl PolymarketApi {
                 .context("Failed to fetch current market price for SELL order. Cannot create market order without current price.")?
         };
         
-        info!("   Using current market price: ${:.4} for {} order", market_price, side);
+        eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
         
         // Use limit order with aggressive pricing to simulate market order
         // This ensures immediate execution at best available price
@@ -671,7 +671,7 @@ impl PolymarketApi {
         };
         
         if response.success {
-            info!("✅ Market order executed successfully! Order ID: {}", response.order_id);
+            eprintln!("✅ Market order executed successfully! Order ID: {}", response.order_id);
         } else {
             let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
             warn!("⚠️  Market order returned error: {}", error_msg);
@@ -699,7 +699,7 @@ impl PolymarketApi {
         request = self.add_auth_headers(request, "POST", path, &body)
             .context("Failed to add authentication headers")?;
 
-        info!("📤 Posting order to Polymarket (HMAC): {} {} {} @ {}", 
+        eprintln!("📤 Posting order to Polymarket (HMAC): {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
 
         let response = request
@@ -732,7 +732,7 @@ impl PolymarketApi {
             .await
             .context("Failed to parse order response")?;
 
-        info!("✅ Order placed successfully: {:?}", order_response);
+        eprintln!("✅ Order placed successfully: {:?}", order_response);
         Ok(order_response)
     }
 
@@ -788,7 +788,7 @@ impl PolymarketApi {
             U256::from(2)  // Down outcome - index set [2]
         };
         
-        info!("🔄 Redeeming winning tokens for condition {} (outcome: {}, index_set: {})", 
+        eprintln!("🔄 Redeeming winning tokens for condition {} (outcome: {}, index_set: {})", 
               condition_id, outcome, index_set);
         
         // Redeem positions by calling CTF contract directly
@@ -806,11 +806,11 @@ impl PolymarketApi {
         let parent_collection_id = B256::ZERO;
         let index_sets = vec![index_set];
         
-        info!("   Prepared redemption parameters:");
-        info!("   - CTF Contract: {}", ctf_address);
-        info!("   - Collateral token (USDC): {}", collateral_token);
-        info!("   - Condition ID: {} ({:?})", condition_id, condition_id_b256);
-        info!("   - Index set: {} (outcome: {})", index_set, outcome);
+        eprintln!("   Prepared redemption parameters:");
+        eprintln!("   - CTF Contract: {}", ctf_address);
+        eprintln!("   - Collateral token (USDC): {}", collateral_token);
+        eprintln!("   - Condition ID: {} ({:?})", condition_id, condition_id_b256);
+        eprintln!("   - Index set: {} (outcome: {})", index_set, outcome);
         
         // Encode the redeemPositions function call
         // Function signature: redeemPositions(address,bytes32,bytes32,uint256[])
@@ -860,7 +860,7 @@ impl PolymarketApi {
         let mut call_data = function_selector;
         call_data.extend_from_slice(&encoded_params);
         
-        info!("   Calling CTF contract to redeem positions...");
+        eprintln!("   Calling CTF contract to redeem positions...");
         
         // Create provider with wallet
         let provider = ProviderBuilder::new()
@@ -884,8 +884,8 @@ impl PolymarketApi {
 
         let tx_hash = *pending_tx.tx_hash();
         
-        info!("   Transaction sent, waiting for confirmation...");
-        info!("   Transaction hash: {:?}", tx_hash);
+        eprintln!("   Transaction sent, waiting for confirmation...");
+        eprintln!("   Transaction hash: {:?}", tx_hash);
         
         // Wait for transaction receipt
         let receipt = pending_tx.get_receipt().await
@@ -903,10 +903,10 @@ impl PolymarketApi {
                 amount_redeemed: None,
             };
             
-            info!("✅ Successfully redeemed winning tokens!");
-            info!("   Transaction hash: {:?}", tx_hash);
+            eprintln!("✅ Successfully redeemed winning tokens!");
+            eprintln!("   Transaction hash: {:?}", tx_hash);
             if let Some(block_number) = receipt.block_number {
-                info!("   Block number: {}", block_number);
+                eprintln!("   Block number: {}", block_number);
             }
             
             Ok(redeem_response)
