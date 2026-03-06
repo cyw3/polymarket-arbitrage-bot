@@ -550,6 +550,7 @@ impl PolymarketApi {
         &self,
         token_id: &str,
         amount: f64,
+        token_to_buy_price: f64,
         side: &str,
         order_type: Option<&str>, // "FOK" or "FAK", defaults to FOK
     ) -> Result<OrderResponse> {
@@ -628,7 +629,7 @@ impl PolymarketApi {
         // Fetch the current best price from the market:
         // - For SELL: Use best bid price (what we get when selling)
         // - For BUY: Use best ask price (what we pay when buying)
-        let market_price = if matches!(side_enum, Side::Buy) {
+        let mut market_price = if matches!(side_enum, Side::Buy) {
             // For BUY orders, get the current ask price (what we pay to buy)
             self.get_price(token_id, "BUY")
                 .await
@@ -640,6 +641,16 @@ impl PolymarketApi {
                 .context("Failed to fetch current market price for SELL order. Cannot create market order without current price.")?
         };
         
+        // Compare with token_to_buy_price and take the smaller value if provided
+        if token_to_buy_price.is_finite() {
+            use rust_decimal::Decimal;
+            let token_price_dec = Decimal::from_f64_retain(token_to_buy_price)
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert token_to_buy_price to Decimal"))?;
+            if token_price_dec < market_price {
+                market_price = token_price_dec;
+            }
+        }
+
         eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
         
         // Use limit order with aggressive pricing to simulate market order

@@ -65,16 +65,17 @@ impl Trader {
         
         // Get current BID price for the token we're buying (what we pay to buy)
         // get_price(token_id, "BUY") returns BID price (what we pay, higher)
-        let price_result = self.api.get_price(&opportunity.token_to_buy_id, "BUY").await;
-        let price = match price_result {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("⚠️  Could not fetch BID price for token: {}", e);
-                return Err(e);
-            }
-        };
+        // let price_result = self.api.get_price(&opportunity.token_to_buy_id, "BUY").await;
+        // let price = match price_result {
+        //     Ok(p) => p,
+        //     Err(e) => {
+        //         warn!("⚠️  Could not fetch BID price for token: {}", e);
+        //         return Err(e);
+        //     }
+        // };
         
-        let price_f64 = f64::try_from(price).unwrap_or(0.0);
+        // let price_f64 = f64::try_from(price).unwrap_or(0.0);
+        let price_f64 = opportunity.token_to_buy_price;
         
         // Safety check: reject if price is 0 or too low (market likely expired)
         if price_f64 <= 0.0 || price_f64 < 0.001 {
@@ -102,6 +103,7 @@ impl Trader {
             match self.api.place_market_order(
                 &opportunity.token_to_buy_id,
                 units_rounded,
+                price_f64,
                 "BUY",
                 Some("FOK"),
             ).await {
@@ -247,6 +249,7 @@ impl Trader {
             match self.api.place_market_order(
                 &trade.token_id,
                 units_to_sell,
+                current_price,
                 "SELL",
                 Some("FOK"),
             ).await {

@@ -103,10 +103,10 @@ impl PriceDetector {
         // Use ASK price for the token we're buying (what we'd receive if selling, but we're buying so this is the lower price)
         let (token_to_buy_id, token_to_buy_price) = if eth_higher_is_up {
             // ETH Up hit $0.99, buy ETH Down
-            (eth_down.token_id.clone(), decimal_to_f64(eth_down.ask.unwrap_or(rust_decimal::Decimal::ZERO)))
+            (eth_down.token_id.clone(), eth_down_price)
         } else {
             // ETH Down hit $0.99, buy ETH Up
-            (eth_up.token_id.clone(), decimal_to_f64(eth_up.ask.unwrap_or(rust_decimal::Decimal::ZERO)))
+            (eth_up.token_id.clone(), eth_up_price)
         };
 
         let higher_token_name = if eth_higher_is_up { "ETH Up" } else { "ETH Down" };
