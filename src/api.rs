@@ -641,6 +641,11 @@ impl PolymarketApi {
                 .context("Failed to fetch current market price for SELL order. Cannot create market order without current price.")?
         };
         
+        // Apply ceiling (upward rounding) and round to 2 decimal places
+        market_price = market_price
+            .ceil()
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+        
         // Compare with token_to_buy_price and take the smaller value if provided
         if token_to_buy_price.is_finite() {
             use rust_decimal::Decimal;
