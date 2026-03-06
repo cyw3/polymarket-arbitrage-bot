@@ -654,7 +654,7 @@ impl PolymarketApi {
                         market_price = token_price_dec;
                     }
                 }
-                Side::Sell => {
+                _ => {
                     // For SELL orders, take the larger price (more favorable for seller)
                     if token_price_dec > market_price {
                         market_price = token_price_dec;
