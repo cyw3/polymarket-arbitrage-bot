@@ -550,7 +550,7 @@ impl PolymarketApi {
         &self,
         token_id: &str,
         amount: f64,
-        token_to_buy_price: f64,
+        target_price: f64,
         side: &str,
         order_type: Option<&str>, // "FOK" or "FAK", defaults to FOK
     ) -> Result<OrderResponse> {
@@ -640,21 +640,33 @@ impl PolymarketApi {
                 .await
                 .context("Failed to fetch current market price for SELL order. Cannot create market order without current price.")?
         };
-        
-        // Apply ceiling (upward rounding) and round to 2 decimal places
-        market_price = market_price
-            .ceil()
-            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-        
-        // Compare with token_to_buy_price and take the smaller value if provided
-        if token_to_buy_price.is_finite() {
+
+        // Compare with target_price and adjust based on order side
+        if target_price.is_finite() {
             use rust_decimal::Decimal;
-            let token_price_dec = Decimal::from_f64_retain(token_to_buy_price)
-                .ok_or_else(|| anyhow::anyhow!("Failed to convert token_to_buy_price to Decimal"))?;
-            if token_price_dec < market_price {
-                market_price = token_price_dec;
+            let token_price_dec = Decimal::from_f64_retain(target_price)
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert target_price to Decimal"))?;
+            
+            match side_enum {
+                Side::Buy => {
+                    // For BUY orders, take the smaller price (more favorable for buyer)
+                    if token_price_dec < market_price {
+                        market_price = token_price_dec;
+                    }
+                }
+                Side::Sell => {
+                    // For SELL orders, take the larger price (more favorable for seller)
+                    if token_price_dec > market_price {
+                        market_price = token_price_dec;
+                    }
+                }
             }
         }
+
+        // Apply floor (downward rounding) and round to 2 decimal places
+        market_price = market_price
+            .floor()
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
 
         eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
         
