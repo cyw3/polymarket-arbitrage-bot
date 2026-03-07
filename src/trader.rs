@@ -158,11 +158,52 @@ impl Trader {
                 .map(|(key, trade)| (key.clone(), trade.clone()))
                 .collect()
         };
-        
+
         for (key, mut trade) in pending_trades {
             // Skip if all units are sold
             if trade.remaining_units <= 0.0 || trade.next_sell_index >= trade.sell_points.len() {
                 continue;
+            }
+            
+            // Calculate time remaining for this market
+            let market_end_timestamp = trade.market_timestamp + 900; // 15 minutes = 900 seconds
+            let time_remaining_seconds = if market_end_timestamp > trade.timestamp {
+                market_end_timestamp - trade.timestamp
+            } else {
+                0
+            };
+            
+            // Check if time remaining is less than min_time_remaining_seconds
+            if time_remaining_seconds <= self.config.min_time_remaining_seconds && trade.remaining_units > 0.0 {
+                crate::log_println!("⏰ Time remaining: {}s <= {}s - Canceling pending orders and selling at $0.03", 
+                      time_remaining_seconds, self.config.min_time_remaining_seconds);
+                
+                // Cancel any pending orders first
+                if let Err(e) = self.cancel_pending_orders(&trade.token_id).await {
+                    warn!("Error canceling pending orders for token {}: {}", &trade.token_id[..16], e);
+                }
+                
+                // Sell all remaining units at $0.03 (ASK price)
+                let sell_price = 0.03;
+                crate::log_println!("💰 Selling all remaining {:.2} units at ASK price ${:.4}", 
+                      trade.remaining_units, sell_price);
+                
+                if let Err(e) = self.execute_sell(&key, &mut trade, trade.remaining_units, sell_price).await {
+                    warn!("Error selling remaining units: {}", e);
+                } else {
+                    // Update trade state - all units sold
+                    trade.remaining_units = 0.0;
+                    trade.next_sell_index = trade.sell_points.len(); // Mark as fully sold
+                    
+                    // Update in HashMap
+                    let mut pending = self.pending_trades.lock().await;
+                    if let Some(t) = pending.get_mut(&key) {
+                        *t = trade;
+                    }
+                    drop(pending);
+                }
+                
+                continue; // Skip normal sell point checking for this trade
             }
             
             // Get current ASK price (what we receive when selling - SELL side)
@@ -222,6 +263,25 @@ impl Trader {
             }
         }
         
+        Ok(())
+    }
+
+    /// Cancel any pending orders for a token
+    async fn cancel_pending_orders(&self, token_id: &str) -> Result<()> {
+        if self.simulation_mode {
+            crate::log_println!("   💡 SIMULATION: Canceling pending orders for token {}", &token_id[..16]);
+            return Ok(());
+        }
+        
+        crate::log_println!("   🔄 Canceling open orders for token {}", &token_id[..16]);
+
+        // 使用 SDK 的 cancel_market_orders 接口，通过 asset_id 一次性取消该 token 的所有挂单
+        if let Err(e) = self.api.cancel_all_open_orders_for_token(token_id).await {
+            warn!("   ⚠️  Failed to cancel open orders for token {}: {}", &token_id[..16], e);
+            return Err(e);
+        }
+
+        crate::log_println!("   ✅ Open orders canceled for token {}", &token_id[..16]);
         Ok(())
     }
 
@@ -354,5 +414,3 @@ impl ToF64 for rust_decimal::Decimal {
         self.to_string().parse().ok()
     }
 }
-
-

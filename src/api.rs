@@ -13,6 +13,7 @@ use std::sync::Arc;
 // Official SDK imports for proper order signing
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::clob::types::request::CancelMarketOrderRequest;
 use polymarket_client_sdk::POLYGON;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
@@ -940,6 +941,73 @@ impl PolymarketApi {
         } else {
             anyhow::bail!("Redemption transaction failed. Transaction hash: {:?}", tx_hash);
         }
+    }
+
+    /// 取消指定 token 的所有未成交挂单
+    ///
+    /// 使用 SDK 的 `cancel_market_orders` 接口，通过 `asset_id` 一次性取消该 token 的所有挂单。
+    /// 等价于 JS: client.cancelMarketOrders({ asset_id: tokenId })
+    pub async fn cancel_all_open_orders_for_token(&self, token_id: &str) -> Result<()> {
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for canceling orders"))?;
+
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer);
+
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}", proxy_addr))?;
+            auth_builder = auth_builder.funder(funder_address);
+
+            let sig_type = match self.signature_type {
+                Some(2) => SignatureType::GnosisSafe,
+                _ => SignatureType::Proxy,
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(0) = self.signature_type {
+            auth_builder = auth_builder.signature_type(SignatureType::Eoa);
+        }
+
+        let client = auth_builder
+            .authenticate()
+            .await
+            .context("Failed to authenticate for cancel_all_open_orders_for_token")?;
+
+        // 将 token_id 字符串解析为 U256（Polymarket token ID 是十进制大整数）
+        let asset_id = U256::from_str_radix(token_id, 10)
+            .context(format!("Failed to parse token_id as U256: {}", token_id))?;
+
+        let request = CancelMarketOrderRequest::builder()
+            .asset_id(asset_id)
+            .build();
+
+        let result = client
+            .cancel_market_orders(&request)
+            .await
+            .context(format!("Failed to cancel market orders for token {}", &token_id[..16.min(token_id.len())]))?;
+
+        info!(
+            "✅ Canceled open orders for token {}: canceled={}, not_canceled={}",
+            &token_id[..16.min(token_id.len())],
+            result.canceled.len(),
+            result.not_canceled.len(),
+        );
+
+        if !result.not_canceled.is_empty() {
+            warn!(
+                "⚠️  {} order(s) could not be canceled for token {}: {:?}",
+                result.not_canceled.len(),
+                &token_id[..16.min(token_id.len())],
+                result.not_canceled,
+            );
+        }
+
+        Ok(())
     }
 }
 
