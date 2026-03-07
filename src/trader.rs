@@ -193,7 +193,8 @@ impl Trader {
                 crate::log_println!("💰 Selling all remaining {:.2} units at ASK price ${:.4}", 
                       trade.remaining_units, sell_price);
                 
-                if let Err(e) = self.execute_sell(&key, &mut trade, trade.remaining_units, sell_price).await {
+                let remaining_units = trade.remaining_units;
+                if let Err(e) = self.execute_sell(&key, &mut trade, remaining_units, sell_price).await {
                     warn!("Error selling remaining units: {}", e);
                 } else {
                     // Update trade state - all units sold
