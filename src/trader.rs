@@ -159,6 +159,11 @@ impl Trader {
                 .collect()
         };
 
+        let now_secs = trade.timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
         for (key, mut trade) in pending_trades {
             // Skip if all units are sold
             if trade.remaining_units <= 0.0 || trade.next_sell_index >= trade.sell_points.len() {
@@ -167,8 +172,8 @@ impl Trader {
             
             // Calculate time remaining for this market
             let market_end_timestamp = trade.market_timestamp + 900; // 15 minutes = 900 seconds
-            let time_remaining_seconds = if market_end_timestamp > trade.timestamp {
-                market_end_timestamp - trade.timestamp
+            let time_remaining_seconds = if market_end_timestamp > now_secs {
+                market_end_timestamp - now_secs
             } else {
                 0
             };
