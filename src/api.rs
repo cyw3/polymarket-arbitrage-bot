@@ -660,13 +660,13 @@ impl PolymarketApi {
                     if token_price_dec > market_price {
                         market_price = token_price_dec;
                     }
-                    // // Apply floor (downward rounding) and round to 2 decimal places
-                    // market_price = market_price
-                    //     .floor()
-                    //     .round_dp_with_strategy(3, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-                    // if market_price == 0 {
-                    //     market_price = 0.01;
-                    // }
+                    // Apply floor (downward rounding) and round to 3 decimal places
+                    market_price = market_price
+                        .floor()
+                        .round_dp_with_strategy(3, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+                    if market_price <= 0 {
+                        market_price = 0.001;
+                    }
                 }
             }
         }
