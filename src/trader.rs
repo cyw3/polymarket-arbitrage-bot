@@ -183,10 +183,10 @@ impl Trader {
                 crate::log_println!("⏰ Time remaining: {}s <= {}s - Canceling pending orders and selling at $0.03", 
                       time_remaining_seconds, self.config.min_time_remaining_seconds);
                 
-                // Cancel any pending orders first
-                if let Err(e) = self.cancel_pending_orders(&trade.token_id).await {
-                    warn!("Error canceling pending orders for token {}: {}", &trade.token_id[..16], e);
-                }
+                // // Cancel any pending orders first
+                // if let Err(e) = self.cancel_pending_orders(&trade.token_id).await {
+                //     warn!("Error canceling pending orders for token {}: {}", &trade.token_id[..16], e);
+                // }
 
                 // Sell all remaining units at stop loss price (ASK price)
                 let sell_price = self.config.stop_loss_price;
