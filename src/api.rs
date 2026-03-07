@@ -978,12 +978,8 @@ impl PolymarketApi {
             .await
             .context("Failed to authenticate for cancel_all_open_orders_for_token")?;
 
-        // 将 token_id 字符串解析为 U256（Polymarket token ID 是十进制大整数）
-        let asset_id = U256::from_str_radix(token_id, 10)
-            .context(format!("Failed to parse token_id as U256: {}", token_id))?;
-
         let request = CancelMarketOrderRequest::builder()
-            .asset_id(asset_id)
+            .asset_id(token_id.to_string())
             .build();
 
         let result = client
