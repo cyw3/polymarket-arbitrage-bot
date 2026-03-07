@@ -165,15 +165,15 @@ impl Trader {
                 continue;
             }
 
-            let now_secs = trade.timestamp
+            let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .unwrap()
                 .as_secs();
             
             // Calculate time remaining for this market
             let market_end_timestamp = trade.market_timestamp + 900; // 15 minutes = 900 seconds
-            let time_remaining_seconds = if market_end_timestamp > now_secs {
-                market_end_timestamp - now_secs
+            let time_remaining_seconds = if market_end_timestamp > current_time {
+                market_end_timestamp - current_time
             } else {
                 0
             };
