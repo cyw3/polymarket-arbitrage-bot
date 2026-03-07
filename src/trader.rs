@@ -180,8 +180,8 @@ impl Trader {
             
             // Check if time remaining is less than min_time_remaining_seconds
             if time_remaining_seconds <= self.config.min_time_remaining_seconds && trade.remaining_units > 0.0 {
-                crate::log_println!("⏰ Time remaining: {}s <= {}s - Canceling pending orders and selling at $0.03", 
-                      time_remaining_seconds, self.config.min_time_remaining_seconds);
+                crate::log_println!("⏰ Time remaining: {}s <= {}s - selling at ${}", 
+                      time_remaining_seconds, self.config.min_time_remaining_seconds, self.config.stop_loss_price);
                 
                 // // Cancel any pending orders first
                 // if let Err(e) = self.cancel_pending_orders(&trade.token_id).await {

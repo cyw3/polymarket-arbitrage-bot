@@ -665,7 +665,7 @@ impl PolymarketApi {
                         .floor()
                         .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
                     if market_price <= Decimal::ZERO {
-                        market_price = Decimal::from_str("0.001").unwrap();
+                        market_price = Decimal::from_str("0.01").unwrap();
                     }
                 }
             }
