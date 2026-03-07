@@ -663,7 +663,7 @@ impl PolymarketApi {
                     // Apply floor (downward rounding) and round to 3 decimal places
                     market_price = market_price
                         .floor()
-                        .round_dp_with_strategy(3, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+                        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
                     if market_price <= Decimal::ZERO {
                         market_price = Decimal::from_str("0.001").unwrap();
                     }
