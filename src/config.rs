@@ -77,6 +77,9 @@ pub struct TradingConfig {
     /// Interval for checking market closure after period ends
     /// Default: 20 (20 seconds)
     pub market_closure_check_interval_seconds: u64,
+    /// Stop loss sell price when time is running out (min_time_remaining_seconds reached)
+    /// Default: 0.01 ($0.01)
+    pub stop_loss_price: f64,
 }
 
 impl Default for Config {
@@ -100,6 +103,7 @@ impl Default for Config {
                 trigger_price: 0.99, // $0.99 ASK price
                 min_time_remaining_seconds: 90, // 90 seconds
                 market_closure_check_interval_seconds: 20, // 20 seconds
+                stop_loss_price: 0.01, // $0.01
             },
         }
     }

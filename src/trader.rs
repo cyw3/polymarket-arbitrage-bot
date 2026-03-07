@@ -188,9 +188,9 @@ impl Trader {
                     warn!("Error canceling pending orders for token {}: {}", &trade.token_id[..16], e);
                 }
 
-                // Sell all remaining units at $0.01 (ASK price)
-                let sell_price = 0.01;
-                crate::log_println!("💰 Selling all remaining {:.2} units at ASK price ${:.4}", 
+                // Sell all remaining units at stop loss price (ASK price)
+                let sell_price = self.config.stop_loss_price;
+                crate::log_println!("💰 Selling all remaining {:.2} units at stop loss price ${:.4}", 
                       trade.remaining_units, sell_price);
                 
                 let remaining_units = trade.remaining_units;
